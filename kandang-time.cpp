@@ -17,16 +17,14 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 25200, 60000);
 
-char ssid[] = "Hisyam";
-char pass[] = "#Hisyam1111";
+char ssid[] = "nama wifi";
+char pass[] = "password wifi";
 
-int umurAyam = 10;  
-
-const int tanggal = 1;
-const char* bulan = "Maret";
-const int tahun = 2025;
+const unsigned long waktuMasukKandang = 1740530400;
 
 int tampilanLCD = 0;  
+
+const char* bulanList[] = {"Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"};
 
 float getAmoniaPPM() {
     int sensorValue = analogRead(MQ135_PIN);
@@ -52,9 +50,17 @@ void bacaSensor() {
     float temperature = dht.readTemperature();
     float amonia = getAmoniaPPM();
     String waktuSekarang = timeClient.getFormattedTime();
+    unsigned long waktuSekarangUnix = timeClient.getEpochTime();
+    int umurAyam = ((waktuSekarangUnix - waktuMasukKandang) / 86400) + 1;
+    
+    struct tm *timeinfo;
+    time_t rawtime = waktuSekarangUnix;
+    timeinfo = localtime(&rawtime);
+    char tanggalSekarang[20];
+    sprintf(tanggalSekarang, "%d %s %d", timeinfo->tm_mday, bulanList[timeinfo->tm_mon], timeinfo->tm_year + 1900);
 
     if (isnan(humidity) || isnan(temperature)) {
-        Serial.println("⚠️ Gagal membaca sensor DHT22!");
+        Serial.println("Gagal membaca sensor DHT22!");
         return;
     }
 
@@ -62,48 +68,50 @@ void bacaSensor() {
     int suhu_min = suhuOptimal.first;
     int suhu_max = suhuOptimal.second;
 
+    if (temperature <= suhu_max) {
+        digitalWrite(RELAY_LAMPU, LOW);
+        Serial.println("Lampu: OFF");
+    } 
     if (temperature < suhu_min) {
         digitalWrite(RELAY_LAMPU, HIGH);
-    } else {
-        digitalWrite(RELAY_LAMPU, LOW);
+        Serial.println("Lampu: ON");
     }
 
-    if (temperature > suhu_max || amonia >= 10) {
+    if (temperature > suhu_max || amonia >= 20) {
         digitalWrite(RELAY_KIPAS, HIGH);
+        Serial.println("Kipas: ON");
     } else {
         digitalWrite(RELAY_KIPAS, LOW);
+        Serial.println("Kipas: OFF");
     }
 
-    Serial.print("🕒 Waktu: "); Serial.print(waktuSekarang);
-    Serial.print(" | 📅 Umur Ayam: "); Serial.print(umurAyam); Serial.print(" hari");
-    Serial.print(" | 🌡 Suhu: "); Serial.print(temperature); Serial.print("°C");
-    Serial.print(" | 💧 Kelembaban: "); Serial.print(humidity); Serial.print("%");
+    Serial.print("Waktu: "); Serial.print(waktuSekarang);
+    Serial.print(" | Tanggal: "); Serial.print(tanggalSekarang);
+    Serial.print(" | Umur Ayam: "); Serial.print(umurAyam); Serial.print(" hari");
+    Serial.print(" | Suhu: "); Serial.print(temperature); Serial.print("°C");
+    Serial.print(" | Kelembaban: "); Serial.print(humidity); Serial.print("%");
     Serial.print(" | NH3: "); Serial.print(amonia); Serial.println(" ppm");
 
     lcd.clear();
     switch (tampilanLCD) {
         case 0:
             lcd.setCursor(0, 0);
-            lcd.print("Tanggal:");
-            lcd.setCursor(0, 1);
-            lcd.print(tanggal);
-            lcd.print(" ");
-            lcd.print(bulan);
-            lcd.print(" ");
-            lcd.print(tahun);
-            break;
-        case 1:
-            lcd.setCursor(0, 0);
-            lcd.print("Jam:");
-            lcd.setCursor(0, 1);
-            lcd.print(waktuSekarang);
-            break;
-        case 2:
-            lcd.setCursor(0, 0);
             lcd.print("Umur Ayam:");
             lcd.setCursor(0, 1);
             lcd.print(umurAyam);
             lcd.print(" Hari");
+            break;
+        case 1:
+            lcd.setCursor(0, 0);
+            lcd.print("Tanggal:");
+            lcd.setCursor(0, 1);
+            lcd.print(tanggalSekarang);
+            break;
+        case 2:
+            lcd.setCursor(0, 0);
+            lcd.print("Jam:");
+            lcd.setCursor(0, 1);
+            lcd.print(waktuSekarang);
             break;
         case 3:
             lcd.setCursor(0, 0);
@@ -145,7 +153,7 @@ void setup() {
     pinMode(RELAY_KIPAS, OUTPUT);
     pinMode(RELAY_LAMPU, OUTPUT);
 
-    Serial.println("✅ Sistem Siap!");
+    Serial.println("Sistem Siap!");
 }
 
 void loop() {
