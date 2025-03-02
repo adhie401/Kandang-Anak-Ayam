@@ -17,8 +17,8 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 25200, 60000);
 
-char ssid[] = "nama wifi";
-char pass[] = "password wifi";
+char ssid[] = "Hisyam";
+char pass[] = "#Hisyam1111";
 
 const unsigned long waktuMasukKandang = 1740530400;
 
@@ -38,10 +38,51 @@ std::pair<int, int> getOptimalTemperature(int umur) {
     if (umur <= 14) return {30, 32};  
     if (umur <= 21) return {28, 30};  
     if (umur <= 28) return {26, 28};  
-    if (umur <= 35) return {24, 26};  
-    if (umur <= 42) return {22, 24};  
-    if (umur <= 56) return {20, 22};  
-    return {18, 22}; 
+    return {24, 31}; 
+}
+
+void updateLCD(int tampilan, int umurAyam, float temperature, float humidity, float amonia, String waktuSekarang, String tanggalSekarang, String tanggalMasuk) {
+    lcd.clear();
+    if (tampilan == 0) {
+        lcd.setCursor(0, 0);
+        lcd.print("Tanggal:");
+        lcd.setCursor(0, 1);
+        lcd.print(tanggalSekarang);
+    } else if (tampilan == 1) {
+        lcd.setCursor(0, 0);
+        lcd.print("Umur Ayam:");
+        lcd.setCursor(0, 1);
+        lcd.print(umurAyam);
+        lcd.print(" hari");
+    } else if (tampilan == 2) {
+        lcd.setCursor(0, 0);
+        lcd.print("Masuk Kandang:");
+        lcd.setCursor(0, 1);
+        lcd.print(tanggalMasuk);
+    } else if (tampilan == 3) {
+        lcd.setCursor(0, 0);
+        lcd.print("Suhu:");
+        lcd.setCursor(0, 1);
+        lcd.print(temperature);
+        lcd.print(" C");
+    } else if (tampilan == 4) {
+        lcd.setCursor(0, 0);
+        lcd.print("Kelembaban:");
+        lcd.setCursor(0, 1);
+        lcd.print(humidity);
+        lcd.print(" %");
+    } else if (tampilan == 5) {
+        lcd.setCursor(0, 0);
+        lcd.print("Amonia NH3:");
+        lcd.setCursor(0, 1);
+        lcd.print(amonia);
+        lcd.print(" ppm");
+    } else {
+        lcd.setCursor(0, 0);
+        lcd.print("Waktu:");
+        lcd.setCursor(0, 1);
+        lcd.print(waktuSekarang);
+    }
 }
 
 void bacaSensor() {
@@ -51,13 +92,18 @@ void bacaSensor() {
     float amonia = getAmoniaPPM();
     String waktuSekarang = timeClient.getFormattedTime();
     unsigned long waktuSekarangUnix = timeClient.getEpochTime();
-    int umurAyam = ((waktuSekarangUnix - waktuMasukKandang) / 86400) + 1;
-    
-    struct tm *timeinfo;
-    time_t rawtime = waktuSekarangUnix;
-    timeinfo = localtime(&rawtime);
+
+    time_t rawtime = waktuSekarangUnix + 25200;
+    struct tm *timeinfo = localtime(&rawtime);
     char tanggalSekarang[20];
     sprintf(tanggalSekarang, "%d %s %d", timeinfo->tm_mday, bulanList[timeinfo->tm_mon], timeinfo->tm_year + 1900);
+
+    time_t rawMasuk = waktuMasukKandang + 25200;
+    struct tm *timeMasukInfo = localtime(&rawMasuk);
+    char tanggalMasuk[20];
+    sprintf(tanggalMasuk, "%d %s %d", timeMasukInfo->tm_mday, bulanList[timeMasukInfo->tm_mon], timeMasukInfo->tm_year + 1900);
+
+    int umurAyam = (((waktuSekarangUnix + 25200 - waktuMasukKandang) / 86400))+1;
 
     if (isnan(humidity) || isnan(temperature)) {
         Serial.println("Gagal membaca sensor DHT22!");
@@ -68,21 +114,17 @@ void bacaSensor() {
     int suhu_min = suhuOptimal.first;
     int suhu_max = suhuOptimal.second;
 
-    if (temperature <= suhu_max) {
-        digitalWrite(RELAY_LAMPU, LOW);
-        Serial.println("Lampu: OFF");
-    } 
     if (temperature < suhu_min) {
         digitalWrite(RELAY_LAMPU, HIGH);
-        Serial.println("Lampu: ON");
-    }
-
-    if (temperature > suhu_max || amonia >= 20) {
+        digitalWrite(RELAY_KIPAS, LOW);
+    } else if (temperature > (suhu_max - 0.1) && temperature < suhu_max) {
+        digitalWrite(RELAY_LAMPU, LOW);
+        digitalWrite(RELAY_KIPAS, LOW);
+    } else if (temperature > suhu_max || amonia >= 20) {
         digitalWrite(RELAY_KIPAS, HIGH);
-        Serial.println("Kipas: ON");
+        digitalWrite(RELAY_LAMPU, LOW);
     } else {
         digitalWrite(RELAY_KIPAS, LOW);
-        Serial.println("Kipas: OFF");
     }
 
     Serial.print("Waktu: "); Serial.print(waktuSekarang);
@@ -92,51 +134,8 @@ void bacaSensor() {
     Serial.print(" | Kelembaban: "); Serial.print(humidity); Serial.print("%");
     Serial.print(" | NH3: "); Serial.print(amonia); Serial.println(" ppm");
 
-    lcd.clear();
-    switch (tampilanLCD) {
-        case 0:
-            lcd.setCursor(0, 0);
-            lcd.print("Umur Ayam:");
-            lcd.setCursor(0, 1);
-            lcd.print(umurAyam);
-            lcd.print(" Hari");
-            break;
-        case 1:
-            lcd.setCursor(0, 0);
-            lcd.print("Tanggal:");
-            lcd.setCursor(0, 1);
-            lcd.print(tanggalSekarang);
-            break;
-        case 2:
-            lcd.setCursor(0, 0);
-            lcd.print("Jam:");
-            lcd.setCursor(0, 1);
-            lcd.print(waktuSekarang);
-            break;
-        case 3:
-            lcd.setCursor(0, 0);
-            lcd.print("Suhu:");
-            lcd.setCursor(0, 1);
-            lcd.print(temperature);
-            lcd.print(" C");
-            break;
-        case 4:
-            lcd.setCursor(0, 0);
-            lcd.print("Kelembaban:");
-            lcd.setCursor(0, 1);
-            lcd.print(humidity);
-            lcd.print(" %");
-            break;
-        case 5:
-            lcd.setCursor(0, 0);
-            lcd.print("NH3:");
-            lcd.setCursor(0, 1);
-            lcd.print(amonia);
-            lcd.print(" ppm");
-            break;
-    }
-
-    tampilanLCD = (tampilanLCD + 1) % 6;
+    updateLCD(tampilanLCD, umurAyam, temperature, humidity, amonia, waktuSekarang, tanggalSekarang, tanggalMasuk);
+    tampilanLCD = (tampilanLCD + 1) % 7;
 }
 
 void setup() {
@@ -152,8 +151,6 @@ void setup() {
     
     pinMode(RELAY_KIPAS, OUTPUT);
     pinMode(RELAY_LAMPU, OUTPUT);
-
-    Serial.println("Sistem Siap!");
 }
 
 void loop() {
