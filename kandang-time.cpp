@@ -17,8 +17,8 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 25200, 60000);
 
-char ssid[] = "Hisyam";
-char pass[] = "#Hisyam1111";
+char ssid[] = "Nama Wifi";
+char pass[] = "Password Wifi";
 
 const unsigned long waktuMasukKandang = 1740530400;
 
