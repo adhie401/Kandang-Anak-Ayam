@@ -15,10 +15,10 @@ DHT dht(DHTPIN, DHTTYPE);
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 25200, 60000);
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000);
 
-char ssid[] = "Nama Wifi";
-char pass[] = "Password Wifi";
+char ssid[] = "Hisyam";
+char pass[] = "#Hisyam1111";
 
 const unsigned long waktuMasukKandang = 1740530400;
 
@@ -93,18 +93,21 @@ void bacaSensor() {
     String waktuSekarang = timeClient.getFormattedTime();
     unsigned long waktuSekarangUnix = timeClient.getEpochTime();
 
-    time_t rawtime = waktuSekarangUnix + 25200;
+    time_t rawtime = waktuSekarangUnix + (7 * 3600);
     struct tm *timeinfo = localtime(&rawtime);
     char tanggalSekarang[20];
     sprintf(tanggalSekarang, "%d %s %d", timeinfo->tm_mday, bulanList[timeinfo->tm_mon], timeinfo->tm_year + 1900);
 
-    time_t rawMasuk = waktuMasukKandang + 25200;
+    time_t rawMasuk = waktuMasukKandang + (7 * 3600);
     struct tm *timeMasukInfo = localtime(&rawMasuk);
     char tanggalMasuk[20];
     sprintf(tanggalMasuk, "%d %s %d", timeMasukInfo->tm_mday, bulanList[timeMasukInfo->tm_mon], timeMasukInfo->tm_year + 1900);
 
-    int umurAyam = (((waktuSekarangUnix + 25200 - waktuMasukKandang) / 86400))+1;
-
+    int umurAyam = (waktuSekarangUnix - waktuMasukKandang) / 86400;
+    if ((waktuSekarangUnix % 86400) < (waktuMasukKandang % 86400)) {
+        umurAyam--;
+    }
+    
     if (isnan(humidity) || isnan(temperature)) {
         Serial.println("Gagal membaca sensor DHT22!");
         return;
@@ -117,16 +120,14 @@ void bacaSensor() {
     if (temperature < suhu_min) {
         digitalWrite(RELAY_LAMPU, HIGH);
         digitalWrite(RELAY_KIPAS, LOW);
-    } else if (temperature > (suhu_max - 0.1) && temperature < suhu_max) {
-        digitalWrite(RELAY_LAMPU, LOW);
-        digitalWrite(RELAY_KIPAS, LOW);
     } else if (temperature > suhu_max || amonia >= 20) {
         digitalWrite(RELAY_KIPAS, HIGH);
         digitalWrite(RELAY_LAMPU, LOW);
     } else {
         digitalWrite(RELAY_KIPAS, LOW);
+        digitalWrite(RELAY_LAMPU, LOW);
     }
-
+    umurAyam = umurAyam + 1;
     Serial.print("Waktu: "); Serial.print(waktuSekarang);
     Serial.print(" | Tanggal: "); Serial.print(tanggalSekarang);
     Serial.print(" | Umur Ayam: "); Serial.print(umurAyam); Serial.print(" hari");
