@@ -20,7 +20,7 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000);
 ESP8266WebServer server(80);
 
 char ssid[] = "nama wifi";
-char pass[] = "Password wifi";
+char pass[] = "password wifi";
 String ipAddress;
 
 const unsigned long waktuMasukKandang = 1740530400;
@@ -114,12 +114,17 @@ void updateLCD() {
             lcd.setCursor(0, 0); lcd.print("Kipas:");
             lcd.setCursor(0, 1); lcd.print(digitalRead(RELAY_KIPAS) ? "ON" : "OFF");
             break;
-        default:
+        case 9:
             lcd.setCursor(0, 0); lcd.print("IP Address:");
             lcd.setCursor(0, 1); lcd.print(ipAddress);
             break;
     }
+    delay(2000);
     tampilanLCD = (tampilanLCD + 1) % 10;
+}
+
+void handleRoot() {
+    server.send(200, "text/html", "<html><body><h1>Monitoring Kandang</h1><p>Tanggal: " + getFormattedDate(timeClient.getEpochTime()) + "</p><p>Jam: " + timeClient.getFormattedTime() + "</p><p>Masuk Kandang: " + getFormattedDate(waktuMasukKandang) + "</p><p>Umur Ayam: " + String(((timeClient.getEpochTime() - waktuMasukKandang) / 86400) + 1) + " hari</p><p>Suhu: " + String(suhu) + " C</p><p>Kelembaban: " + String(kelembaban) + " %</p><p>Amonia NH3: " + String(amonia) + " ppm</p><p>Lampu: " + (digitalRead(RELAY_LAMPU) ? "ON" : "OFF") + "</p><p>Kipas: " + (digitalRead(RELAY_KIPAS) ? "ON" : "OFF") + "</p><p>IP Address: " + ipAddress + "</p></body></html>");
 }
 
 void setup() {
@@ -137,19 +142,13 @@ void setup() {
     server.begin();
 }
 
-unsigned long lastUpdate = 0;
-const long updateInterval = 2000;
-
 void loop() {
     ESP.wdtFeed();
     timeClient.update();
     server.handleClient();
-    if (millis() - lastUpdate >= updateInterval) {
-        lastUpdate = millis();
-        suhu = dht.readTemperature();
-        kelembaban = dht.readHumidity();
-        amonia = getAmoniaPPM();
-        kontrolSuhu();
-        updateLCD();
-    }
+    suhu = dht.readTemperature();
+    kelembaban = dht.readHumidity();
+    amonia = getAmoniaPPM();
+    kontrolSuhu();
+    updateLCD();
 }
