@@ -1,4 +1,5 @@
 #include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 #include <DHT.h>
@@ -16,21 +17,27 @@ DHT dht(DHTPIN, DHTTYPE);
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000);
+ESP8266WebServer server(80);
 
-char ssid[] = "Hisyam";
-char pass[] = "#Hisyam1111";
+char ssid[] = "Nama_WiFi";
+char pass[] = "Password_WiFi";
+String ipAddress;
 
 const unsigned long waktuMasukKandang = 1740530400;
-
 int tampilanLCD = 0;  
+bool sensorError = false;
 
 const char* bulanList[] = {"Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"};
+
+float suhu, kelembaban, amonia;
+String tanggal, waktuSekarang;
+int umurAyam;
+String statusLampu, statusKipas;
 
 float getAmoniaPPM() {
     int sensorValue = analogRead(MQ135_PIN);
     float voltage = sensorValue * (3.3 / 1024.0);
-    float ppm = voltage * 10.0;
-    return ppm;
+    return voltage * 10.0;
 }
 
 std::pair<int, int> getOptimalTemperature(int umur) {
@@ -38,123 +45,142 @@ std::pair<int, int> getOptimalTemperature(int umur) {
     if (umur <= 14) return {30, 32};  
     if (umur <= 21) return {28, 30};  
     if (umur <= 28) return {26, 28};  
-    return {24, 31}; 
-}
-
-void updateLCD(int tampilan, int umurAyam, float temperature, float humidity, float amonia, String waktuSekarang, String tanggalSekarang, String tanggalMasuk) {
-    lcd.clear();
-    if (tampilan == 0) {
-        lcd.setCursor(0, 0);
-        lcd.print("Tanggal:");
-        lcd.setCursor(0, 1);
-        lcd.print(tanggalSekarang);
-    } else if (tampilan == 1) {
-        lcd.setCursor(0, 0);
-        lcd.print("Umur Ayam:");
-        lcd.setCursor(0, 1);
-        lcd.print(umurAyam);
-        lcd.print(" hari");
-    } else if (tampilan == 2) {
-        lcd.setCursor(0, 0);
-        lcd.print("Masuk Kandang:");
-        lcd.setCursor(0, 1);
-        lcd.print(tanggalMasuk);
-    } else if (tampilan == 3) {
-        lcd.setCursor(0, 0);
-        lcd.print("Suhu:");
-        lcd.setCursor(0, 1);
-        lcd.print(temperature);
-        lcd.print(" C");
-    } else if (tampilan == 4) {
-        lcd.setCursor(0, 0);
-        lcd.print("Kelembaban:");
-        lcd.setCursor(0, 1);
-        lcd.print(humidity);
-        lcd.print(" %");
-    } else if (tampilan == 5) {
-        lcd.setCursor(0, 0);
-        lcd.print("Amonia NH3:");
-        lcd.setCursor(0, 1);
-        lcd.print(amonia);
-        lcd.print(" ppm");
-    } else {
-        lcd.setCursor(0, 0);
-        lcd.print("Waktu:");
-        lcd.setCursor(0, 1);
-        lcd.print(waktuSekarang);
-    }
+    return {26, 31}; 
 }
 
 void bacaSensor() {
     timeClient.update();
-    float humidity = dht.readHumidity();
-    float temperature = dht.readTemperature();
-    float amonia = getAmoniaPPM();
-    String waktuSekarang = timeClient.getFormattedTime();
-    unsigned long waktuSekarangUnix = timeClient.getEpochTime();
+    kelembaban = dht.readHumidity();
+    suhu = dht.readTemperature();
+    amonia = getAmoniaPPM();
 
-    time_t rawtime = waktuSekarangUnix + (7 * 3600);
-    struct tm *timeinfo = localtime(&rawtime);
-    char tanggalSekarang[20];
-    sprintf(tanggalSekarang, "%d %s %d", timeinfo->tm_mday, bulanList[timeinfo->tm_mon], timeinfo->tm_year + 1900);
+    time_t epochTime = timeClient.getEpochTime();
+    struct tm *timeInfo = localtime(&epochTime);
+    tanggal = String(timeInfo->tm_mday) + " " + bulanList[timeInfo->tm_mon] + " " + String(timeInfo->tm_year + 1900);
+    waktuSekarang = timeClient.getFormattedTime();
 
-    time_t rawMasuk = waktuMasukKandang + (7 * 3600);
-    struct tm *timeMasukInfo = localtime(&rawMasuk);
-    char tanggalMasuk[20];
-    sprintf(tanggalMasuk, "%d %s %d", timeMasukInfo->tm_mday, bulanList[timeMasukInfo->tm_mon], timeMasukInfo->tm_year + 1900);
-
-    int umurAyam = (waktuSekarangUnix - waktuMasukKandang) / 86400;
-    if ((waktuSekarangUnix % 86400) < (waktuMasukKandang % 86400)) {
-        umurAyam--;
-    }
-    
-    if (isnan(humidity) || isnan(temperature)) {
-        Serial.println("Gagal membaca sensor DHT22!");
+    if (isnan(kelembaban) || isnan(suhu)) {
+        sensorError = true;
+        Serial.println("⚠ Sensor Gagal Membaca Data!");
         return;
+    } else {
+        sensorError = false;
     }
 
+    umurAyam = ((epochTime - waktuMasukKandang) / 86400) + 1;
+    int jam = timeClient.getHours();
     auto suhuOptimal = getOptimalTemperature(umurAyam);
     int suhu_min = suhuOptimal.first;
     int suhu_max = suhuOptimal.second;
 
-    if (temperature < suhu_min) {
+    bool bolehLampuNyala = umurAyam <= 35 || (jam < 7 || jam >= 17);
+
+    if (suhu < suhu_min && bolehLampuNyala) {
         digitalWrite(RELAY_LAMPU, HIGH);
         digitalWrite(RELAY_KIPAS, LOW);
-    } else if (temperature > suhu_max || amonia >= 20) {
+    } else if (suhu > suhu_max || amonia >= 20) {
         digitalWrite(RELAY_KIPAS, HIGH);
         digitalWrite(RELAY_LAMPU, LOW);
     } else {
         digitalWrite(RELAY_KIPAS, LOW);
         digitalWrite(RELAY_LAMPU, LOW);
     }
-    umurAyam = umurAyam + 1;
-    Serial.print("Waktu: "); Serial.print(waktuSekarang);
-    Serial.print(" | Tanggal: "); Serial.print(tanggalSekarang);
-    Serial.print(" | Umur Ayam: "); Serial.print(umurAyam); Serial.print(" hari");
-    Serial.print(" | Suhu: "); Serial.print(temperature); Serial.print("°C");
-    Serial.print(" | Kelembaban: "); Serial.print(humidity); Serial.print("%");
-    Serial.print(" | NH3: "); Serial.print(amonia); Serial.println(" ppm");
 
-    updateLCD(tampilanLCD, umurAyam, temperature, humidity, amonia, waktuSekarang, tanggalSekarang, tanggalMasuk);
-    tampilanLCD = (tampilanLCD + 1) % 7;
+    statusLampu = digitalRead(RELAY_LAMPU) ? "ON" : "OFF";
+    statusKipas = digitalRead(RELAY_KIPAS) ? "ON" : "OFF";
+}
+
+void updateLCD() {
+    lcd.clear();
+    switch (tampilanLCD) {
+        case 0:
+            lcd.setCursor(0, 0); lcd.print("Tanggal:");
+            lcd.setCursor(0, 1); lcd.print(tanggal);
+            break;
+        case 1:
+            lcd.setCursor(0, 0); lcd.print("Jam:");
+            lcd.setCursor(0, 1); lcd.print(waktuSekarang);
+            break;
+        case 2:
+            lcd.setCursor(0, 0); lcd.print("Umur Ayam:");
+            lcd.setCursor(0, 1); lcd.print(umurAyam); lcd.print(" hari");
+            break;
+        case 3:
+            lcd.setCursor(0, 0); lcd.print("Suhu:");
+            lcd.setCursor(0, 1); lcd.print(suhu); lcd.print(" C");
+            break;
+        case 4:
+            lcd.setCursor(0, 0); lcd.print("Kelembaban:");
+            lcd.setCursor(0, 1); lcd.print(kelembaban); lcd.print(" %");
+            break;
+        case 5:
+            lcd.setCursor(0, 0); lcd.print("Amonia NH3:");
+            lcd.setCursor(0, 1); lcd.print(amonia); lcd.print(" ppm");
+            break;
+        case 6:
+            lcd.setCursor(0, 0); lcd.print("Lampu:");
+            lcd.setCursor(0, 1); lcd.print(statusLampu);
+            break;
+        case 7:
+            lcd.setCursor(0, 0); lcd.print("Kipas:");
+            lcd.setCursor(0, 1); lcd.print(statusKipas);
+            break;
+        default:
+            lcd.setCursor(0, 0); lcd.print("IP Address:");
+            lcd.setCursor(0, 1); lcd.print(ipAddress);
+            break;
+    }
+    tampilanLCD = (tampilanLCD + 1) % 9;
+}
+
+void handleRoot() {
+    String html = "<html><head><title>Monitoring Kandang</title>";
+    html += "<style>body{font-family:Arial;text-align:center;background:#f4f4f4;}";
+    html += "h1{color:#333;} .status{font-size:18px;font-weight:bold;}";
+    html += ".error{color:red;}</style></head><body>";
+
+    html += "<h1>Monitoring Kandang Ayam 01</h1>";
+    html += "<p><b>IP Address: </b>" + ipAddress + "</p>";
+    html += "<p><b>Tanggal: </b>" + tanggal + "</p>";
+    html += "<p><b>Jam: </b>" + waktuSekarang + "</p>";
+
+    if (sensorError) {
+        html += "<p class='error'>⚠ Sensor Gagal Membaca Data!</p>";
+    } else {
+        html += "<p><b>Umur Ayam: </b>" + String(umurAyam) + " hari</p>";
+        html += "<p><b>Suhu: </b>" + String(suhu) + " °C</p>";
+        html += "<p><b>Kelembaban: </b>" + String(kelembaban) + " %</p>";
+        html += "<p><b>Amonia NH3: </b>" + String(amonia) + " ppm</p>";
+    }
+
+    html += "<p class='status'><b>Lampu: </b>" + statusLampu + "</p>";
+    html += "<p class='status'><b>Kipas: </b>" + statusKipas + "</p>";
+
+    html += "</body></html>";
+    server.send(200, "text/html", html);
 }
 
 void setup() {
     Serial.begin(115200);
     WiFi.begin(ssid, pass);
     while (WiFi.status() != WL_CONNECTED) { delay(500); }
+    ipAddress = WiFi.localIP().toString();
 
     timeClient.begin();
     dht.begin();
     lcd.init();
     lcd.backlight();
-    lcd.clear();
-    
+
     pinMode(RELAY_KIPAS, OUTPUT);
     pinMode(RELAY_LAMPU, OUTPUT);
+
+    server.on("/", handleRoot);
+    server.begin();
 }
 
 void loop() {
     bacaSensor();
+    updateLCD();
+    server.handleClient();
     delay(2000);
 }
