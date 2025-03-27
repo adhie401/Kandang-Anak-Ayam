@@ -23,7 +23,7 @@ char ssid[] = "nama wifi";
 char pass[] = "password wifi";
 String ipAddress;
 
-const unsigned long waktuMasukKandang = 1740530400;
+const unsigned long waktuMasukKandang = 1742486400;
 int tampilanLCD = 0;  
 bool sensorError = false;
 
