@@ -17,14 +17,16 @@ DHT dht(DHTPIN, DHTTYPE);
 #define MAX_LOGS 20
 #define SENSOR_INTERVAL 10000
 #define SEND_INTERVAL 300000
+#define VENTILATION_INTERVAL 3600000
+#define VENTILATION_DURATION 300000
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600);
 ESP8266WebServer server(80);
 
-const char* ssid = "Hisyam";
-const char* password = "#Hisyam1111";
+const char* ssid = "Nama Wifi";
+const char* password = "password wifi";
 const unsigned long waktuMasukKandang = 1742428800;
 
 struct DeviceLog {
@@ -40,17 +42,23 @@ float suhu, kelembaban, amonia;
 unsigned long lampuStart = 0, kipasStart = 0;
 int tampilanLCD = 0;
 
-const char* spreadsheetId = "your gsheet id";
-const String logSheet = "Logs";
-const String sensorSheet = "Sensor";
+const char* spreadsheetId = "google sheet id";
+const String logSheet = "sheet name";
+const String sensorSheet = "sheet name";
 
-#define PROJECT_ID "your project id"
-#define CLIENT_EMAIL "service account mail"
-const char PRIVATE_KEY[] PROGMEM = "your private key";
+#define PROJECT_ID "project id"
+#define CLIENT_EMAIL "email service account"
+const char PRIVATE_KEY[] PROGMEM = "private key json";
 
-std::pair<int, int> getOptimalTemperature(int umur) {
-  static const std::pair<int, int> tempTable[] = {{32,34},{30,32},{28,30},{26,28},{26,31}};
+std::pair<float, float> getOptimalTemperature(int umur) {
+  static const std::pair<float, float> tempTable[] = {{32.0,34.0},{30.0,32.0},{28.0,30.0},{26.0,28.0},{26.0,31.0}};
   return tempTable[(umur <= 7) ? 0 : (umur <= 14) ? 1 : (umur <= 21) ? 2 : (umur <= 28) ? 3 : 4];
+}
+
+std::pair<float, float> getOptimalHumidity(int umur) {
+  if(umur <= 7) return {60.0, 70.0};
+  else if(umur <= 14) return {55.0, 65.0};
+  else return {50.0, 60.0};
 }
 
 String getFormattedDate(unsigned long epochTime) {
@@ -127,19 +135,58 @@ bool bacaSensor() {
 }
 
 void kontrolSuhu() {
-  static bool currentState = false;
+  static bool currentLampState = false;
+  static bool currentFanState = false;
+  static unsigned long lastVentilation = 0;
+  
   int umur = ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1;
   auto suhuOptimal = getOptimalTemperature(umur);
+  auto kelembabanOptimal = getOptimalHumidity(umur);
   int jam = timeClient.getHours();
-  bool newState = (suhu < suhuOptimal.first && (umur <= 35 || (jam <7 || jam >=17))) ? HIGH : 
-                 (suhu > suhuOptimal.second || amonia >=20) ? LOW : currentState;
+  
+  bool newLampState = currentLampState;
+  bool newFanState = currentFanState;
 
-  if(newState != currentState) {
-    digitalWrite(RELAY_LAMPU, newState);
-    digitalWrite(RELAY_KIPAS, !newState);
-    handleDeviceEvent("LAMP", newState);
-    handleDeviceEvent("FAN", !newState);
-    currentState = newState;
+  if(millis() - lastVentilation > VENTILATION_INTERVAL) {
+    newFanState = HIGH;
+    lastVentilation = millis();
+    delay(VENTILATION_DURATION);
+    newFanState = LOW;
+  }
+
+  if(amonia >= 15) {
+    newLampState = LOW;
+    newFanState = HIGH;
+  }
+  else if(kelembaban > kelembabanOptimal.second) {
+    newLampState = LOW;
+    newFanState = HIGH;
+  }
+  else if(umur > 35) {
+    bool waktuMalam = (jam >= 17 || jam < 7);
+    newLampState = waktuMalam ? (suhu < suhuOptimal.first ? HIGH : LOW) : LOW;
+    newFanState = (suhu >= (suhuOptimal.second + 0.5)) ? HIGH : LOW;
+  }
+  else {
+    newLampState = (suhu < suhuOptimal.first) ? HIGH : 
+                   (suhu >= suhuOptimal.second) ? LOW : currentLampState;
+    newFanState = (suhu >= (suhuOptimal.second + 0.5)) ? HIGH : LOW;
+  }
+
+  if(kelembaban < kelembabanOptimal.first) {
+    newFanState = LOW;
+  }
+
+  if(newLampState != currentLampState) {
+    digitalWrite(RELAY_LAMPU, newLampState);
+    handleDeviceEvent("LAMP", newLampState);
+    currentLampState = newLampState;
+  }
+
+  if(newFanState != currentFanState) {
+    digitalWrite(RELAY_KIPAS, newFanState);
+    handleDeviceEvent("FAN", newFanState);
+    currentFanState = newFanState;
   }
 }
 
@@ -147,9 +194,11 @@ void updateLCD() {
   static int lastPage = -1;
   int currentPage = tampilanLCD%11;
   if(currentPage == lastPage) return;
+  
   lcd.clear();
   int umur = ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1;
   auto suhuOptimal = getOptimalTemperature(umur);
+  auto kelembabanOptimal = getOptimalHumidity(umur);
   
   const char* headers[] = {"Tanggal:","Jam:","Masuk Kandang:","Umur:","Suhu:",
                           "Kelembaban:","Amonia:","Lampu:","Kipas:","Log Terakhir:","IP:"};
@@ -163,12 +212,26 @@ void updateLCD() {
     case 1: lcd.print(timeClient.getFormattedTime().substring(0,8)); break;
     case 2: lcd.print(getFormattedDate(waktuMasukKandang)); break;
     case 3: lcd.print(String(umur)+" hari"); break;
-    case 4: lcd.print(String(suhu,2)+"C/"+String(suhuOptimal.first)+"-"+String(suhuOptimal.second)+"C"); break;
+    case 4: 
+      lcd.print(String(suhu,2)+"C/"+String(suhuOptimal.first,2)+"-"+String(suhuOptimal.second,2)+"C");
+      lcd.setCursor(0,1);
+      lcd.print("H:"+String(kelembabanOptimal.first,0)+"-"+String(kelembabanOptimal.second,0)+"%");
+      break;
     case 5: lcd.print(String(kelembaban,2)+" %"); break;
     case 6: lcd.print(String(amonia,2)+" ppm"); break;
     case 7: lcd.print(digitalRead(RELAY_LAMPU)?"ON ":"OFF"); break;
     case 8: lcd.print(digitalRead(RELAY_KIPAS)?"ON ":"OFF"); break;
-    case 9: if(logIndex>0) lcd.print(logBuffer[logIndex-1].start.substring(0,5)+"-"+(logBuffer[logIndex-1].end!=""?logBuffer[logIndex-1].end.substring(0,5):"ON")); break;
+    case 9: 
+      if(logIndex>0) {
+        String logText = logBuffer[logIndex-1].start.substring(0,5) + "-";
+        if(logBuffer[logIndex-1].end != "") {
+          logText += logBuffer[logIndex-1].end.substring(0,5);
+        } else {
+          logText += "ON (" + formatDuration(logBuffer[logIndex-1].duration) + ")";
+        }
+        lcd.print(logText);
+      }
+      break;
     case 10: lcd.print(WiFi.localIP().toString()); break;
   }
   lastPage = currentPage;
@@ -211,25 +274,38 @@ void setup() {
     
     int umur = ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1;
     auto suhuOptimal = getOptimalTemperature(umur);
+    auto kelembabanOptimal = getOptimalHumidity(umur);
     
-    const String items[] = {
-      getFormattedDate(timeClient.getEpochTime()),
-      timeClient.getFormattedTime(),
-      getFormattedDate(waktuMasukKandang),
-      String(umur)+" hari",
-      String(suhu,2)+" &deg;C (Target: "+String(suhuOptimal.first)+"-"+String(suhuOptimal.second)+" &deg;C)",
-      String(kelembaban,2)+"%",
-      String(amonia,2)+" ppm",
-      digitalRead(RELAY_LAMPU)?"ON":"OFF",
-      digitalRead(RELAY_KIPAS)?"ON":"OFF",
-      logIndex>0?logBuffer[logIndex-1].start+" - "+(logBuffer[logIndex-1].end!=""?logBuffer[logIndex-1].end:"ON")+" ("+formatDuration(logBuffer[logIndex-1].duration)+")":"No logs",
-      WiFi.localIP().toString()
-    };
+    String items[11];
+    items[0] = getFormattedDate(timeClient.getEpochTime());
+    items[1] = timeClient.getFormattedTime();
+    items[2] = getFormattedDate(waktuMasukKandang);
+    items[3] = String(umur)+" hari";
+    items[4] = String(suhu,2)+" &deg;C (Target: "+String(suhuOptimal.first,2)+"-"+String(suhuOptimal.second,2)+" &deg;C)";
+    items[5] = String(kelembaban,2)+" % (Target: "+String(kelembabanOptimal.first,0)+"-"+String(kelembabanOptimal.second,0)+"%)";
+    items[6] = String(amonia,2)+" ppm";
+    items[7] = digitalRead(RELAY_LAMPU)?"ON":"OFF";
+    items[8] = digitalRead(RELAY_KIPAS)?"ON":"OFF";
+    
+    if(logIndex>0) {
+      items[9] = logBuffer[logIndex-1].start+" - ";
+      if(logBuffer[logIndex-1].end != "") {
+        items[9] += logBuffer[logIndex-1].end;
+      } else {
+        items[9] += "ON (" + formatDuration(logBuffer[logIndex-1].duration) + ")";
+      }
+    } else {
+      items[9] = "No logs";
+    }
+    
+    items[10] = WiFi.localIP().toString();
     
     const char* headers[] = {"Tanggal","Jam","Masuk Kandang","Umur","Suhu",
                             "Kelembaban","Amonia","Lampu","Kipas","Log Terakhir","IP Address"};
     
-    for(int i=0;i<11;i++) html += "<li><b>"+String(headers[i])+":</b> "+items[i]+"</li>";
+    for(int i=0;i<11;i++) {
+      html += "<li><b>"+String(headers[i])+":</b> "+items[i]+"</li>";
+    }
     html += "</ol></div></body></html>";
     server.send(200, "text/html", html);
   });
@@ -241,7 +317,9 @@ void loop() {
   updateTime();
   server.handleClient();
   
-  if(bacaSensor()) kontrolSuhu();
+  if(bacaSensor()) {
+    kontrolSuhu();
+  }
   
   static unsigned long lastSend = 0;
   if(millis()-lastSend >= SEND_INTERVAL) {
