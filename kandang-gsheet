@@ -1,0 +1,274 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP_Google_Sheet_Client.h>
+#include <ArduinoJson.h>
+
+#define DHTPIN 2
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+#define RELAY_KIPAS 14
+#define RELAY_LAMPU 12
+#define MQ135_PIN A0
+#define MAX_LOGS 20
+#define SENSOR_INTERVAL 10000
+#define SEND_INTERVAL 300000
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600);
+ESP8266WebServer server(80);
+
+const char* ssid = "Hisyam";
+const char* password = "#Hisyam1111";
+const unsigned long waktuMasukKandang = 1742428800;
+
+struct DeviceLog {
+  String type;
+  String start;
+  String end;
+  unsigned long duration;
+};
+DeviceLog logBuffer[MAX_LOGS];
+int logIndex = 0;
+
+float suhu, kelembaban, amonia;
+unsigned long lampuStart = 0, kipasStart = 0;
+int tampilanLCD = 0;
+
+const char* spreadsheetId = "your gsheet id";
+const String logSheet = "Logs";
+const String sensorSheet = "Sensor";
+
+#define PROJECT_ID "your project id"
+#define CLIENT_EMAIL "service account mail"
+const char PRIVATE_KEY[] PROGMEM = "your private key";
+
+std::pair<int, int> getOptimalTemperature(int umur) {
+  static const std::pair<int, int> tempTable[] = {{32,34},{30,32},{28,30},{26,28},{26,31}};
+  return tempTable[(umur <= 7) ? 0 : (umur <= 14) ? 1 : (umur <= 21) ? 2 : (umur <= 28) ? 3 : 4];
+}
+
+String getFormattedDate(unsigned long epochTime) {
+  time_t rawTime = epochTime;
+  struct tm *timeInfo = localtime(&rawTime);
+  const char* bulan[] = {"Jan","Feb","Mar","Apr","Mei","Jun","Jul","Ags","Sep","Okt","Nov","Des"};
+  return String(timeInfo->tm_mday) + " " + bulan[timeInfo->tm_mon] + " " + String(timeInfo->tm_year + 1900);
+}
+
+float getAmoniaPPM() {
+  return analogRead(MQ135_PIN) * (3.3/1024.0) * 10.0;
+}
+
+String formatDuration(unsigned long ms) {
+  unsigned long secs = ms/1000;
+  char buf[9];
+  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu", secs/3600, (secs%3600)/60, secs%60);
+  return String(buf);
+}
+
+void handleDeviceEvent(String type, bool state) {
+  if(logIndex >= MAX_LOGS) {
+    memmove(&logBuffer[0], &logBuffer[1], sizeof(DeviceLog)*(MAX_LOGS-1));
+    logIndex = MAX_LOGS-1;
+  }
+  
+  if(state) {
+    logBuffer[logIndex] = {type, timeClient.getFormattedTime(), "", 0};
+    if(type == "LAMP") lampuStart = millis();
+    else kipasStart = millis();
+  } else {
+    logBuffer[logIndex].end = timeClient.getFormattedTime();
+    logBuffer[logIndex].duration = (type == "LAMP") ? (millis()-lampuStart) : (millis()-kipasStart);
+    logIndex++;
+  }
+}
+
+void sendLogs() {
+  if(WiFi.status() == WL_CONNECTED && GSheet.ready()) {
+    FirebaseJson response;
+    FirebaseJsonArray requestsArray;
+
+    for(int i=0; i<logIndex; i++) {
+      FirebaseJson valueRange;
+      valueRange.add("range", logSheet);
+      FirebaseJsonArray values;
+      values.add(logBuffer[i].type);
+      values.add(logBuffer[i].start);
+      values.add(logBuffer[i].end);
+      values.add(formatDuration(logBuffer[i].duration));
+      valueRange.add("values", values);
+      requestsArray.add(valueRange);
+    }
+    
+    GSheet.batchUpdate(&response, spreadsheetId, &requestsArray);
+    logIndex = 0;
+  }
+}
+
+bool bacaSensor() {
+  static unsigned long lastRead = 0;
+  if(millis()-lastRead >= SENSOR_INTERVAL) {
+    suhu = dht.readTemperature();
+    kelembaban = dht.readHumidity();
+    amonia = getAmoniaPPM();
+    
+    if(isnan(suhu)) suhu = 0;
+    if(isnan(kelembaban)) kelembaban = 0;
+    
+    lastRead = millis();
+    return true;
+  }
+  return false;
+}
+
+void kontrolSuhu() {
+  static bool currentState = false;
+  int umur = ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1;
+  auto suhuOptimal = getOptimalTemperature(umur);
+  int jam = timeClient.getHours();
+  bool newState = (suhu < suhuOptimal.first && (umur <= 35 || (jam <7 || jam >=17))) ? HIGH : 
+                 (suhu > suhuOptimal.second || amonia >=20) ? LOW : currentState;
+
+  if(newState != currentState) {
+    digitalWrite(RELAY_LAMPU, newState);
+    digitalWrite(RELAY_KIPAS, !newState);
+    handleDeviceEvent("LAMP", newState);
+    handleDeviceEvent("FAN", !newState);
+    currentState = newState;
+  }
+}
+
+void updateLCD() {
+  static int lastPage = -1;
+  int currentPage = tampilanLCD%11;
+  if(currentPage == lastPage) return;
+  lcd.clear();
+  int umur = ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1;
+  auto suhuOptimal = getOptimalTemperature(umur);
+  
+  const char* headers[] = {"Tanggal:","Jam:","Masuk Kandang:","Umur:","Suhu:",
+                          "Kelembaban:","Amonia:","Lampu:","Kipas:","Log Terakhir:","IP:"};
+  
+  lcd.setCursor(0,0);
+  lcd.print(headers[currentPage]);
+  lcd.setCursor(0,1);
+  
+  switch(currentPage) {
+    case 0: lcd.print(getFormattedDate(timeClient.getEpochTime())); break;
+    case 1: lcd.print(timeClient.getFormattedTime().substring(0,8)); break;
+    case 2: lcd.print(getFormattedDate(waktuMasukKandang)); break;
+    case 3: lcd.print(String(umur)+" hari"); break;
+    case 4: lcd.print(String(suhu,2)+"C/"+String(suhuOptimal.first)+"-"+String(suhuOptimal.second)+"C"); break;
+    case 5: lcd.print(String(kelembaban,2)+" %"); break;
+    case 6: lcd.print(String(amonia,2)+" ppm"); break;
+    case 7: lcd.print(digitalRead(RELAY_LAMPU)?"ON ":"OFF"); break;
+    case 8: lcd.print(digitalRead(RELAY_KIPAS)?"ON ":"OFF"); break;
+    case 9: if(logIndex>0) lcd.print(logBuffer[logIndex-1].start.substring(0,5)+"-"+(logBuffer[logIndex-1].end!=""?logBuffer[logIndex-1].end.substring(0,5):"ON")); break;
+    case 10: lcd.print(WiFi.localIP().toString()); break;
+  }
+  lastPage = currentPage;
+  tampilanLCD++;
+}
+
+void maintainWiFi() {
+  static unsigned long lastCheck = 0;
+  if(millis()-lastCheck <30000) return;
+  if(WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+  lastCheck = millis();
+}
+
+void updateTime() {
+  static unsigned long lastUpdate = 0;
+  if(millis()-lastUpdate <60000) return;
+  timeClient.update();
+  lastUpdate = millis();
+}
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(ssid, password);
+  while(WiFi.status() != WL_CONNECTED) delay(500);
+  
+  timeClient.begin();
+  timeClient.forceUpdate();
+  dht.begin();
+  lcd.init();
+  lcd.backlight();
+  
+  pinMode(RELAY_KIPAS, OUTPUT);
+  pinMode(RELAY_LAMPU, OUTPUT);
+  
+  GSheet.begin(CLIENT_EMAIL, PROJECT_ID, PRIVATE_KEY);
+
+  server.on("/", []() {
+    timeClient.update();
+    String html = "<html><head><meta charset='UTF-8'></head><body style='font-family:Arial'><h1>Monitoring Kandang Ayam</h1><div style='border:1px solid #ccc;padding:20px;border-radius:10px'><ol>";
+    
+    int umur = ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1;
+    auto suhuOptimal = getOptimalTemperature(umur);
+    
+    const String items[] = {
+      getFormattedDate(timeClient.getEpochTime()),
+      timeClient.getFormattedTime(),
+      getFormattedDate(waktuMasukKandang),
+      String(umur)+" hari",
+      String(suhu,2)+" &deg;C (Target: "+String(suhuOptimal.first)+"-"+String(suhuOptimal.second)+" &deg;C)",
+      String(kelembaban,2)+"%",
+      String(amonia,2)+" ppm",
+      digitalRead(RELAY_LAMPU)?"ON":"OFF",
+      digitalRead(RELAY_KIPAS)?"ON":"OFF",
+      logIndex>0?logBuffer[logIndex-1].start+" - "+(logBuffer[logIndex-1].end!=""?logBuffer[logIndex-1].end:"ON")+" ("+formatDuration(logBuffer[logIndex-1].duration)+")":"No logs",
+      WiFi.localIP().toString()
+    };
+    
+    const char* headers[] = {"Tanggal","Jam","Masuk Kandang","Umur","Suhu",
+                            "Kelembaban","Amonia","Lampu","Kipas","Log Terakhir","IP Address"};
+    
+    for(int i=0;i<11;i++) html += "<li><b>"+String(headers[i])+":</b> "+items[i]+"</li>";
+    html += "</ol></div></body></html>";
+    server.send(200, "text/html", html);
+  });
+  server.begin();
+}
+
+void loop() {
+  maintainWiFi();
+  updateTime();
+  server.handleClient();
+  
+  if(bacaSensor()) kontrolSuhu();
+  
+  static unsigned long lastSend = 0;
+  if(millis()-lastSend >= SEND_INTERVAL) {
+    FirebaseJson response;
+    FirebaseJson valueRange;
+
+    valueRange.add("majorDimension", "COLUMNS");
+    valueRange.set("values/[0]/[0]", getFormattedDate(timeClient.getEpochTime())+" "+timeClient.getFormattedTime());
+    valueRange.set("values/[1]/[0]", ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1);
+    valueRange.set("values/[2]/[0]", suhu);
+    valueRange.set("values/[3]/[0]", kelembaban);
+    valueRange.set("values/[4]/[0]", amonia);
+    valueRange.set("values/[5]/[0]", digitalRead(RELAY_LAMPU) ? "ON" : "OFF");
+    valueRange.set("values/[6]/[0]", digitalRead(RELAY_KIPAS) ? "ON" : "OFF");
+    valueRange.set("values/[7]/[0]", WiFi.localIP().toString());
+
+    bool success = GSheet.values.append(&response, 
+                                      spreadsheetId, 
+                                      String(sensorSheet + "!A1").c_str(), 
+                                      &valueRange);
+    sendLogs();
+    lastSend = millis();
+  }
+  
+  static unsigned long lastLCD = 0;
+  if(millis() - lastLCD >= 2000) {
+    updateLCD();
+    lastLCD = millis();
+  }
+}
