@@ -14,7 +14,7 @@ DHT dht(DHTPIN, DHTTYPE);
 #define RELAY_KIPAS 14
 #define RELAY_LAMPU 12
 #define MQ135_PIN A0
-#define MAX_LOGS 20
+#define MAX_LOGS 50
 #define SENSOR_INTERVAL 10000
 #define SEND_INTERVAL 300000
 #define VENTILATION_INTERVAL 3600000
@@ -25,8 +25,8 @@ WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600);
 ESP8266WebServer server(80);
 
-const char* ssid = "Nama Wifi";
-const char* password = "password wifi";
+const char* ssid = "SSID";
+const char* password = "Password";
 const unsigned long waktuMasukKandang = 1742428800;
 
 struct DeviceLog {
@@ -39,16 +39,16 @@ DeviceLog logBuffer[MAX_LOGS];
 int logIndex = 0;
 
 float suhu, kelembaban, amonia;
-unsigned long lampuStart = 0, kipasStart = 0;
+unsigned long lampuStart = 0, kipasStart = 0, lastVentilation = 0;
 int tampilanLCD = 0;
 
-const char* spreadsheetId = "google sheet id";
-const String logSheet = "sheet name";
-const String sensorSheet = "sheet name";
+const char* spreadsheetId = "1JmoSOS-vDcWTocTzMMD03yGqywlKXwkG2AljmN3zj4k";
+const String logSheet = "Logs";
+const String sensorSheet = "Sensor";
 
-#define PROJECT_ID "project id"
-#define CLIENT_EMAIL "email service account"
-const char PRIVATE_KEY[] PROGMEM = "private key json";
+#define PROJECT_ID "solid-heaven-365404"
+#define CLIENT_EMAIL "gsheet@solid-heaven-365404.iam.gserviceaccount.com"
+const char PRIVATE_KEY[] PROGMEM = "-----BEGIN PRIVATE KEY-----";
 
 std::pair<float, float> getOptimalTemperature(int umur) {
   static const std::pair<float, float> tempTable[] = {{32.0,34.0},{30.0,32.0},{28.0,30.0},{26.0,28.0},{26.0,31.0}};
@@ -80,6 +80,7 @@ String formatDuration(unsigned long ms) {
 }
 
 void handleDeviceEvent(String type, bool state) {
+  noInterrupts();
   if(logIndex >= MAX_LOGS) {
     memmove(&logBuffer[0], &logBuffer[1], sizeof(DeviceLog)*(MAX_LOGS-1));
     logIndex = MAX_LOGS-1;
@@ -94,27 +95,31 @@ void handleDeviceEvent(String type, bool state) {
     logBuffer[logIndex].duration = (type == "LAMP") ? (millis()-lampuStart) : (millis()-kipasStart);
     logIndex++;
   }
+  interrupts();
 }
 
 void sendLogs() {
-  if(WiFi.status() == WL_CONNECTED && GSheet.ready()) {
+  if (WiFi.status() == WL_CONNECTED && GSheet.ready() && logIndex > 0) {
+    noInterrupts();
     FirebaseJson response;
-    FirebaseJsonArray requestsArray;
-
-    for(int i=0; i<logIndex; i++) {
-      FirebaseJson valueRange;
-      valueRange.add("range", logSheet);
-      FirebaseJsonArray values;
-      values.add(logBuffer[i].type);
-      values.add(logBuffer[i].start);
-      values.add(logBuffer[i].end);
-      values.add(formatDuration(logBuffer[i].duration));
-      valueRange.add("values", values);
-      requestsArray.add(valueRange);
+    FirebaseJson valueRange;
+    valueRange.add("majorDimension", "ROWS");
+    FirebaseJsonArray values;
+    
+    for (int i = 0; i < logIndex; i++) {
+      FirebaseJsonArray row;
+      row.add(logBuffer[i].type);
+      row.add(logBuffer[i].start);
+      row.add(logBuffer[i].end);
+      row.add(formatDuration(logBuffer[i].duration));
+      values.add(row);
     }
     
-    GSheet.batchUpdate(&response, spreadsheetId, &requestsArray);
-    logIndex = 0;
+    valueRange.add("values", values);
+    bool success = GSheet.values.append(&response, spreadsheetId, String(logSheet + "!A1").c_str(), &valueRange);
+    
+    if (success) logIndex = 0;
+    interrupts();
   }
 }
 
@@ -124,12 +129,8 @@ bool bacaSensor() {
     suhu = dht.readTemperature();
     kelembaban = dht.readHumidity();
     amonia = getAmoniaPPM();
-    
-    if(isnan(suhu)) suhu = 0;
-    if(isnan(kelembaban)) kelembaban = 0;
-    
     lastRead = millis();
-    return true;
+    return !isnan(suhu) && !isnan(kelembaban);
   }
   return false;
 }
@@ -137,7 +138,6 @@ bool bacaSensor() {
 void kontrolSuhu() {
   static bool currentLampState = false;
   static bool currentFanState = false;
-  static unsigned long lastVentilation = 0;
   
   int umur = ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1;
   auto suhuOptimal = getOptimalTemperature(umur);
@@ -146,13 +146,6 @@ void kontrolSuhu() {
   
   bool newLampState = currentLampState;
   bool newFanState = currentFanState;
-
-  if(millis() - lastVentilation > VENTILATION_INTERVAL) {
-    newFanState = HIGH;
-    lastVentilation = millis();
-    delay(VENTILATION_DURATION);
-    newFanState = LOW;
-  }
 
   if(amonia >= 15) {
     newLampState = LOW;
@@ -173,9 +166,7 @@ void kontrolSuhu() {
     newFanState = (suhu >= (suhuOptimal.second + 0.5)) ? HIGH : LOW;
   }
 
-  if(kelembaban < kelembabanOptimal.first) {
-    newFanState = LOW;
-  }
+  if(kelembaban < kelembabanOptimal.first) newFanState = LOW;
 
   if(newLampState != currentLampState) {
     digitalWrite(RELAY_LAMPU, newLampState);
@@ -192,48 +183,96 @@ void kontrolSuhu() {
 
 void updateLCD() {
   static int lastPage = -1;
-  int currentPage = tampilanLCD%11;
+  static unsigned long lastUpdate = 0;
+  
+  if(millis() - lastUpdate < 2000) return;
+  lastUpdate = millis();
+
+  int currentPage = tampilanLCD % 11;
   if(currentPage == lastPage) return;
   
   lcd.clear();
+  delay(2);
+
   int umur = ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1;
   auto suhuOptimal = getOptimalTemperature(umur);
   auto kelembabanOptimal = getOptimalHumidity(umur);
   
-  const char* headers[] = {"Tanggal:","Jam:","Masuk Kandang:","Umur:","Suhu:",
-                          "Kelembaban:","Amonia:","Lampu:","Kipas:","Log Terakhir:","IP:"};
-  
-  lcd.setCursor(0,0);
-  lcd.print(headers[currentPage]);
-  lcd.setCursor(0,1);
-  
   switch(currentPage) {
-    case 0: lcd.print(getFormattedDate(timeClient.getEpochTime())); break;
-    case 1: lcd.print(timeClient.getFormattedTime().substring(0,8)); break;
-    case 2: lcd.print(getFormattedDate(waktuMasukKandang)); break;
-    case 3: lcd.print(String(umur)+" hari"); break;
-    case 4: 
-      lcd.print(String(suhu,2)+"C/"+String(suhuOptimal.first,2)+"-"+String(suhuOptimal.second,2)+"C");
-      lcd.setCursor(0,1);
-      lcd.print("H:"+String(kelembabanOptimal.first,0)+"-"+String(kelembabanOptimal.second,0)+"%");
+    case 0:
+      lcd.setCursor(0, 0);
+      lcd.print("Tanggal:");
+      lcd.setCursor(0, 1);
+      lcd.print(getFormattedDate(timeClient.getEpochTime()));
       break;
-    case 5: lcd.print(String(kelembaban,2)+" %"); break;
-    case 6: lcd.print(String(amonia,2)+" ppm"); break;
-    case 7: lcd.print(digitalRead(RELAY_LAMPU)?"ON ":"OFF"); break;
-    case 8: lcd.print(digitalRead(RELAY_KIPAS)?"ON ":"OFF"); break;
-    case 9: 
+    case 1:
+      lcd.setCursor(0, 0);
+      lcd.print("Jam:");
+      lcd.setCursor(0, 1);
+      lcd.print(timeClient.getFormattedTime().substring(0,8));
+      break;
+    case 2:
+      lcd.setCursor(0, 0);
+      lcd.print("Masuk Kandang:");
+      lcd.setCursor(0, 1);
+      lcd.print(getFormattedDate(waktuMasukKandang));
+      break;
+    case 3:
+      lcd.setCursor(0, 0);
+      lcd.print("Umur:");
+      lcd.setCursor(0, 1);
+      lcd.print(String(umur)+" hari");
+      break;
+    case 4:
+      lcd.setCursor(0, 0);
+      lcd.print("Suhu : " + String(suhu,2) + "\xDF" "C");
+      lcd.setCursor(0, 1);
+      lcd.print("Range: " + String(suhuOptimal.first,0) + "-" + String(suhuOptimal.second,0) + "\xDF" "C");
+      break;
+    case 5:
+      lcd.setCursor(0, 0);
+      lcd.print("Kelemb: " + String(kelembaban,0) + "%");
+      lcd.setCursor(0, 1);
+      lcd.print("Range : " + String(kelembabanOptimal.first,0) + "-" + String(kelembabanOptimal.second,0) + "%");
+      break;
+    case 6:
+      lcd.setCursor(0, 0);
+      lcd.print("Amonia:");
+      lcd.setCursor(0, 1);
+      lcd.print(String(amonia,2) + " ppm");
+      break;
+    case 7:
+      lcd.setCursor(0, 0);
+      lcd.print("Lampu:");
+      lcd.setCursor(0, 1);
+      lcd.print(digitalRead(RELAY_LAMPU)?"ON":"OFF");
+      break;
+    case 8:
+      lcd.setCursor(0, 0);
+      lcd.print("Kipas:");
+      lcd.setCursor(0, 1);
+      lcd.print(digitalRead(RELAY_KIPAS)?"ON":"OFF");
+      break;
+    case 9:
+      lcd.setCursor(0, 0);
+      lcd.print("Log Terakhir:");
+      lcd.setCursor(0, 1);
       if(logIndex>0) {
-        String logText = logBuffer[logIndex-1].start.substring(0,5) + "-";
-        if(logBuffer[logIndex-1].end != "") {
-          logText += logBuffer[logIndex-1].end.substring(0,5);
-        } else {
-          logText += "ON (" + formatDuration(logBuffer[logIndex-1].duration) + ")";
-        }
-        lcd.print(logText);
+        int showIndex = logIndex - 1;
+        lcd.print(logBuffer[showIndex].start.substring(0,5) + "-" + 
+                 (logBuffer[showIndex].end != "" ? logBuffer[showIndex].end.substring(0,5) : "ON"));
+      } else {
+        lcd.print("No logs");
       }
       break;
-    case 10: lcd.print(WiFi.localIP().toString()); break;
+    case 10:
+      lcd.setCursor(0, 0);
+      lcd.print("IP:");
+      lcd.setCursor(0, 1);
+      lcd.print(WiFi.localIP().toString());
+      break;
   }
+
   lastPage = currentPage;
   tampilanLCD++;
 }
@@ -241,7 +280,10 @@ void updateLCD() {
 void maintainWiFi() {
   static unsigned long lastCheck = 0;
   if(millis()-lastCheck <30000) return;
-  if(WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+  if(WiFi.status() != WL_CONNECTED) {
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+  }
   lastCheck = millis();
 }
 
@@ -270,7 +312,7 @@ void setup() {
 
   server.on("/", []() {
     timeClient.update();
-    String html = "<html><head><meta charset='UTF-8'></head><body style='font-family:Arial'><h1>Monitoring Kandang Ayam</h1><div style='border:1px solid #ccc;padding:20px;border-radius:10px'><ol>";
+    String html = "<html><head><meta charset='UTF-8'><meta http-equiv='refresh' content='10'></head><body style='font-family:Arial'><h1>Monitoring Kandang Ayam</h1><div style='border:1px solid #ccc;padding:20px;border-radius:10px'><ol>";
     
     int umur = ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1;
     auto suhuOptimal = getOptimalTemperature(umur);
@@ -281,31 +323,23 @@ void setup() {
     items[1] = timeClient.getFormattedTime();
     items[2] = getFormattedDate(waktuMasukKandang);
     items[3] = String(umur)+" hari";
-    items[4] = String(suhu,2)+" &deg;C (Target: "+String(suhuOptimal.first,2)+"-"+String(suhuOptimal.second,2)+" &deg;C)";
-    items[5] = String(kelembaban,2)+" % (Target: "+String(kelembabanOptimal.first,0)+"-"+String(kelembabanOptimal.second,0)+"%)";
-    items[6] = String(amonia,2)+" ppm";
+    items[4] = String(suhu,2) + " °C (Range: "+String(suhuOptimal.first,0)+"-"+String(suhuOptimal.second,0)+" °C)";
+    items[5] = String(kelembaban,0) + " % (Range: "+String(kelembabanOptimal.first,0)+"-"+String(kelembabanOptimal.second,0)+"%)";
+    items[6] = String(amonia,2) + " ppm";
     items[7] = digitalRead(RELAY_LAMPU)?"ON":"OFF";
     items[8] = digitalRead(RELAY_KIPAS)?"ON":"OFF";
     
     if(logIndex>0) {
-      items[9] = logBuffer[logIndex-1].start+" - ";
-      if(logBuffer[logIndex-1].end != "") {
-        items[9] += logBuffer[logIndex-1].end;
-      } else {
-        items[9] += "ON (" + formatDuration(logBuffer[logIndex-1].duration) + ")";
-      }
-    } else {
-      items[9] = "No logs";
-    }
+      int showIndex = (logIndex > 0) ? logIndex-1 : MAX_LOGS-1;
+      items[9] = logBuffer[showIndex].start + " - " + (logBuffer[showIndex].end != "" ? logBuffer[showIndex].end : "ON");
+    } else items[9] = "No logs";
     
     items[10] = WiFi.localIP().toString();
     
     const char* headers[] = {"Tanggal","Jam","Masuk Kandang","Umur","Suhu",
                             "Kelembaban","Amonia","Lampu","Kipas","Log Terakhir","IP Address"};
     
-    for(int i=0;i<11;i++) {
-      html += "<li><b>"+String(headers[i])+":</b> "+items[i]+"</li>";
-    }
+    for(int i=0;i<11;i++) html += "<li><b>"+String(headers[i])+":</b> "+items[i]+"</li>";
     html += "</ol></div></body></html>";
     server.send(200, "text/html", html);
   });
@@ -316,30 +350,26 @@ void loop() {
   maintainWiFi();
   updateTime();
   server.handleClient();
+  yield();
   
-  if(bacaSensor()) {
-    kontrolSuhu();
-  }
+  if(bacaSensor()) kontrolSuhu();
   
   static unsigned long lastSend = 0;
   if(millis()-lastSend >= SEND_INTERVAL) {
-    FirebaseJson response;
-    FirebaseJson valueRange;
+    FirebaseJson sensorResponse;
+    FirebaseJson sensorValueRange;
+    
+    sensorValueRange.add("majorDimension", "COLUMNS");
+    sensorValueRange.set("values/[0]/[0]", getFormattedDate(timeClient.getEpochTime())+" "+timeClient.getFormattedTime());
+    sensorValueRange.set("values/[1]/[0]", ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1);
+    sensorValueRange.set("values/[2]/[0]", String(suhu,2).toFloat());
+    sensorValueRange.set("values/[3]/[0]", String(kelembaban,2).toFloat());
+    sensorValueRange.set("values/[4]/[0]", String(amonia,2).toFloat());
+    sensorValueRange.set("values/[5]/[0]", digitalRead(RELAY_LAMPU) ? "ON" : "OFF");
+    sensorValueRange.set("values/[6]/[0]", digitalRead(RELAY_KIPAS) ? "ON" : "OFF");
+    sensorValueRange.set("values/[7]/[0]", WiFi.localIP().toString());
 
-    valueRange.add("majorDimension", "COLUMNS");
-    valueRange.set("values/[0]/[0]", getFormattedDate(timeClient.getEpochTime())+" "+timeClient.getFormattedTime());
-    valueRange.set("values/[1]/[0]", ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1);
-    valueRange.set("values/[2]/[0]", suhu);
-    valueRange.set("values/[3]/[0]", kelembaban);
-    valueRange.set("values/[4]/[0]", amonia);
-    valueRange.set("values/[5]/[0]", digitalRead(RELAY_LAMPU) ? "ON" : "OFF");
-    valueRange.set("values/[6]/[0]", digitalRead(RELAY_KIPAS) ? "ON" : "OFF");
-    valueRange.set("values/[7]/[0]", WiFi.localIP().toString());
-
-    bool success = GSheet.values.append(&response, 
-                                      spreadsheetId, 
-                                      String(sensorSheet + "!A1").c_str(), 
-                                      &valueRange);
+    GSheet.values.append(&sensorResponse, spreadsheetId, String(sensorSheet + "!A1").c_str(), &sensorValueRange);
     sendLogs();
     lastSend = millis();
   }
@@ -348,5 +378,21 @@ void loop() {
   if(millis() - lastLCD >= 2000) {
     updateLCD();
     lastLCD = millis();
+  }
+
+  static unsigned long ventilationStart = 0;
+  static bool isVentilating = false;
+  if(millis() - lastVentilation > VENTILATION_INTERVAL) {
+    digitalWrite(RELAY_KIPAS, HIGH);
+    handleDeviceEvent("FAN", true);
+    lastVentilation = millis();
+    ventilationStart = millis();
+    isVentilating = true;
+  }
+  
+  if(isVentilating && (millis() - ventilationStart >= VENTILATION_DURATION)) {
+    digitalWrite(RELAY_KIPAS, LOW);
+    handleDeviceEvent("FAN", false);
+    isVentilating = false;
   }
 }
