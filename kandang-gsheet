@@ -26,7 +26,7 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600);
 ESP8266WebServer server(80);
 
 const char* ssid = "SSID";
-const char* password = "Password";
+const char* password = "PaSSwoRd";
 const unsigned long waktuMasukKandang = 1742428800;
 
 struct DeviceLog {
@@ -37,6 +37,14 @@ struct DeviceLog {
 };
 DeviceLog logBuffer[MAX_LOGS];
 int logIndex = 0;
+
+struct Device {
+  bool state;
+  unsigned long totalRuntime;
+};
+
+Device lampu = {false, 0};
+Device kipas = {false, 0};
 
 float suhu, kelembaban, amonia;
 unsigned long lampuStart = 0, kipasStart = 0, lastVentilation = 0;
@@ -49,6 +57,8 @@ const String sensorSheet = "Sensor";
 #define PROJECT_ID "solid-heaven-365404"
 #define CLIENT_EMAIL "gsheet@solid-heaven-365404.iam.gserviceaccount.com"
 const char PRIVATE_KEY[] PROGMEM = "-----BEGIN PRIVATE KEY-----";
+
+String webLogs = "";
 
 std::pair<float, float> getOptimalTemperature(int umur) {
   static const std::pair<float, float> tempTable[] = {{32.0,34.0},{30.0,32.0},{28.0,30.0},{26.0,28.0},{26.0,31.0}};
@@ -81,20 +91,23 @@ String formatDuration(unsigned long ms) {
 
 void handleDeviceEvent(String type, bool state) {
   noInterrupts();
-  if(logIndex >= MAX_LOGS) {
-    memmove(&logBuffer[0], &logBuffer[1], sizeof(DeviceLog)*(MAX_LOGS-1));
-    logIndex = MAX_LOGS-1;
+  if (logIndex >= MAX_LOGS) {
+    memmove(&logBuffer[0], &logBuffer[1], sizeof(DeviceLog) * (MAX_LOGS - 1));
+    logIndex = MAX_LOGS - 1;
   }
-  
-  if(state) {
+
+  if (state) {
     logBuffer[logIndex] = {type, timeClient.getFormattedTime(), "", 0};
-    if(type == "LAMP") lampuStart = millis();
+    if (type == "LAMP") lampuStart = millis();
     else kipasStart = millis();
+    addWebLog(type + " turned ON");
   } else {
     logBuffer[logIndex].end = timeClient.getFormattedTime();
-    logBuffer[logIndex].duration = (type == "LAMP") ? (millis()-lampuStart) : (millis()-kipasStart);
+    logBuffer[logIndex].duration = (type == "LAMP") ? (millis() - lampuStart) : (millis() - kipasStart);
     logIndex++;
+    addWebLog(type + " turned OFF");
   }
+  addWebLog("Current logIndex: " + String(logIndex));
   interrupts();
 }
 
@@ -104,22 +117,32 @@ void sendLogs() {
     FirebaseJson response;
     FirebaseJson valueRange;
     valueRange.add("majorDimension", "ROWS");
-    FirebaseJsonArray values;
-    
-    for (int i = 0; i < logIndex; i++) {
-      FirebaseJsonArray row;
-      row.add(logBuffer[i].type);
-      row.add(logBuffer[i].start);
-      row.add(logBuffer[i].end);
-      row.add(formatDuration(logBuffer[i].duration));
-      values.add(row);
+
+    int logsToSend = min(logIndex, 10);
+    for (int i = 0; i < logsToSend; i++) {
+      valueRange.set("values/[" + String(i) + "]/[0]", logBuffer[i].type);
+      valueRange.set("values/[" + String(i) + "]/[1]", logBuffer[i].start);
+      valueRange.set("values/[" + String(i) + "]/[2]", logBuffer[i].end);
+      valueRange.set("values/[" + String(i) + "]/[3]", formatDuration(logBuffer[i].duration));
+      yield();
     }
-    
-    valueRange.add("values", values);
+
     bool success = GSheet.values.append(&response, spreadsheetId, String(logSheet + "!A1").c_str(), &valueRange);
-    
-    if (success) logIndex = 0;
+
+    if (success) {
+      addWebLog("Logs sent successfully.");
+      memmove(&logBuffer[0], &logBuffer[logsToSend], sizeof(DeviceLog) * (logIndex - logsToSend));
+      logIndex -= logsToSend;
+      addWebLog("Updated logIndex: " + String(logIndex));
+    } else {
+      addWebLog("Failed to send logs.");
+      addWebLog("Response: " + String(response.raw()));
+    }
     interrupts();
+  } else {
+    if (WiFi.status() != WL_CONNECTED) addWebLog("WiFi is not connected.");
+    if (!GSheet.ready()) addWebLog("Google Sheets API is not ready.");
+    if (logIndex <= 0) addWebLog("No logs available to send.");
   }
 }
 
@@ -257,10 +280,10 @@ void updateLCD() {
       lcd.setCursor(0, 0);
       lcd.print("Log Terakhir:");
       lcd.setCursor(0, 1);
-      if(logIndex>0) {
+      if (logIndex > 0) {
         int showIndex = logIndex - 1;
-        lcd.print(logBuffer[showIndex].start.substring(0,5) + "-" + 
-                 (logBuffer[showIndex].end != "" ? logBuffer[showIndex].end.substring(0,5) : "ON"));
+        lcd.print(logBuffer[showIndex].start.substring(0, 5) + "-" +
+                  (logBuffer[showIndex].end != "" ? logBuffer[showIndex].end.substring(0, 5) : "ON"));
       } else {
         lcd.print("No logs");
       }
@@ -279,10 +302,13 @@ void updateLCD() {
 
 void maintainWiFi() {
   static unsigned long lastCheck = 0;
-  if(millis()-lastCheck <30000) return;
-  if(WiFi.status() != WL_CONNECTED) {
+  if (millis() - lastCheck < 30000) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    addWebLog("WiFi is not connected. Reconnecting...");
     WiFi.disconnect();
     WiFi.begin(ssid, password);
+    delay(5000);
+    return;
   }
   lastCheck = millis();
 }
@@ -292,6 +318,11 @@ void updateTime() {
   if(millis()-lastUpdate <60000) return;
   timeClient.update();
   lastUpdate = millis();
+}
+
+void addWebLog(String message) {
+  String timestamp = getFormattedDate(timeClient.getEpochTime()) + " " + timeClient.getFormattedTime();
+  webLogs += "<p><span class='timestamp'>[" + timestamp + "]</span> " + message + "</p>";
 }
 
 void setup() {
@@ -310,40 +341,72 @@ void setup() {
   
   GSheet.begin(CLIENT_EMAIL, PROJECT_ID, PRIVATE_KEY);
 
-  server.on("/", []() {
+  server.on("/", [=]() {
     timeClient.update();
-    String html = "<html><head><meta charset='UTF-8'><meta http-equiv='refresh' content='10'></head><body style='font-family:Arial'><h1>Monitoring Kandang Ayam</h1><div style='border:1px solid #ccc;padding:20px;border-radius:10px'><ol>";
-    
-    int umur = ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1;
-    auto suhuOptimal = getOptimalTemperature(umur);
-    auto kelembabanOptimal = getOptimalHumidity(umur);
-    
-    String items[11];
-    items[0] = getFormattedDate(timeClient.getEpochTime());
-    items[1] = timeClient.getFormattedTime();
-    items[2] = getFormattedDate(waktuMasukKandang);
-    items[3] = String(umur)+" hari";
-    items[4] = String(suhu,2) + " °C (Range: "+String(suhuOptimal.first,0)+"-"+String(suhuOptimal.second,0)+" °C)";
-    items[5] = String(kelembaban,0) + " % (Range: "+String(kelembabanOptimal.first,0)+"-"+String(kelembabanOptimal.second,0)+"%)";
-    items[6] = String(amonia,2) + " ppm";
-    items[7] = digitalRead(RELAY_LAMPU)?"ON":"OFF";
-    items[8] = digitalRead(RELAY_KIPAS)?"ON":"OFF";
-    
-    if(logIndex>0) {
-      int showIndex = (logIndex > 0) ? logIndex-1 : MAX_LOGS-1;
-      items[9] = logBuffer[showIndex].start + " - " + (logBuffer[showIndex].end != "" ? logBuffer[showIndex].end : "ON");
-    } else items[9] = "No logs";
-    
-    items[10] = WiFi.localIP().toString();
-    
-    const char* headers[] = {"Tanggal","Jam","Masuk Kandang","Umur","Suhu",
-                            "Kelembaban","Amonia","Lampu","Kipas","Log Terakhir","IP Address"};
-    
-    for(int i=0;i<11;i++) html += "<li><b>"+String(headers[i])+":</b> "+items[i]+"</li>";
-    html += "</ol></div></body></html>";
+    int umur = ((timeClient.getEpochTime() - waktuMasukKandang) / 86400) + 1;
+
+    String html = "<!DOCTYPE html><html><head>";
+    html += "<meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<title>Monitoring Kandang Ayam</title>";
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; }";
+    html += ".header { background-color: #4CAF50; color: white; padding: 10px; text-align: center; }";
+    html += ".container { display: flex; flex: 1; overflow: hidden; }";
+    html += ".panel { flex: 1; padding: 15px; overflow-y: auto; box-sizing: border-box; }";
+    html += ".sensor-panel { background-color: #f9f9f9; border-right: 1px solid #ddd; }";
+    html += ".log-panel { background-color: #f0f0f0; }";
+    html += "h2 { color: #333; border-bottom: 1px solid #ddd; padding-bottom: 5px; }";
+    html += ".sensor-value { margin-bottom: 15px; padding: 10px; background: white; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }";
+    html += ".log-entry { margin-bottom: 8px; padding: 5px; background: white; border-radius: 3px; font-family: monospace; font-size: 14px; }";
+    html += ".timestamp { color: #666; font-weight: bold; }";
+    html += ".range-value { color: #007bff; font-weight: bold; }";
+    html += "</style></head><body>";
+
+    html += "<div class='header'><h1>Monitoring Kandang Ayam</h1></div>";
+    html += "<div class='container'>";
+
+    html += "<div class='panel sensor-panel'>";
+    html += "<h2>Data Sensor</h2>";
+
+    html += "<div class='sensor-value'>";
+    html += "<h3>Status Sistem</h3>";
+    html += "<p>Waktu: " + getFormattedDate(timeClient.getEpochTime()) + " " + timeClient.getFormattedTime() + "</p>";
+    html += "<p>Umur Ayam: " + String(umur) + " hari</p>";
+    html += "<p>Range Suhu Optimal: <span class='range-value'>" + String(getOptimalTemperature(umur).first, 1) + "°C - " + String(getOptimalTemperature(umur).second, 1) + "°C</span></p>";
+    html += "<p>Range Kelembaban Optimal: <span class='range-value'>" + String(getOptimalHumidity(umur).first, 1) + "% - " + String(getOptimalHumidity(umur).second, 1) + "%</span></p>";
+    html += "</div>";
+
+    html += "<div class='sensor-value'>";
+    html += "<h3>Suhu & Kelembaban</h3>";
+    html += "<p>Suhu: " + String(suhu, 1) + " °C</p>";
+    html += "<p>Kelembaban: " + String(kelembaban, 0) + "%</p>";
+    html += "<p>Amonia: " + String(amonia, 1) + " ppm</p>";
+    html += "</div>";
+
+    html += "<div class='sensor-value'>";
+    html += "<h3>Status Perangkat</h3>";
+    html += "<p>Lampu: " + String(lampu.state ? "ON" : "OFF") + " (Total: " + String(lampu.totalRuntime / 3600, 1) + " jam)</p>";
+    html += "<p>Kipas: " + String(kipas.state ? "ON" : "OFF") + " (Total: " + String(kipas.totalRuntime / 3600, 1) + " jam)</p>";
+    html += "</div>";
+
+    html += "</div>";
+
+    html += "<div class='panel log-panel'>";
+    html += "<h2>Event Log</h2>";
+    html += "<div>";
+    html += webLogs;
+    html += "</div>";
+    html += "</div>";
+
+    html += "</div>";
+    html += "</body></html>";
+
     server.send(200, "text/html", html);
   });
   server.begin();
+  addWebLog("Sistem diinisialisasi");
+  addWebLog("IP Address: " + WiFi.localIP().toString());
 }
 
 void loop() {
@@ -352,47 +415,58 @@ void loop() {
   server.handleClient();
   yield();
   
-  if(bacaSensor()) kontrolSuhu();
+  if (bacaSensor()) kontrolSuhu();
   
   static unsigned long lastSend = 0;
-  if(millis()-lastSend >= SEND_INTERVAL) {
+  if (millis() - lastSend >= SEND_INTERVAL) {
+    if (!GSheet.ready()) {
+      addWebLog("Google Sheets API is not ready. Check credentials or API configuration.");
+      return;
+    }
+
     FirebaseJson sensorResponse;
     FirebaseJson sensorValueRange;
-    
+
     sensorValueRange.add("majorDimension", "COLUMNS");
-    sensorValueRange.set("values/[0]/[0]", getFormattedDate(timeClient.getEpochTime())+" "+timeClient.getFormattedTime());
-    sensorValueRange.set("values/[1]/[0]", ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1);
-    sensorValueRange.set("values/[2]/[0]", String(suhu,2).toFloat());
-    sensorValueRange.set("values/[3]/[0]", String(kelembaban,2).toFloat());
-    sensorValueRange.set("values/[4]/[0]", String(amonia,2).toFloat());
+    sensorValueRange.set("values/[0]/[0]", getFormattedDate(timeClient.getEpochTime()) + " " + timeClient.getFormattedTime());
+    sensorValueRange.set("values/[1]/[0]", ((timeClient.getEpochTime() - waktuMasukKandang) / 86400) + 1);
+    sensorValueRange.set("values/[2]/[0]", String(suhu, 2).toFloat());
+    sensorValueRange.set("values/[3]/[0]", String(kelembaban, 2).toFloat());
+    sensorValueRange.set("values/[4]/[0]", String(amonia, 2).toFloat());
     sensorValueRange.set("values/[5]/[0]", digitalRead(RELAY_LAMPU) ? "ON" : "OFF");
     sensorValueRange.set("values/[6]/[0]", digitalRead(RELAY_KIPAS) ? "ON" : "OFF");
     sensorValueRange.set("values/[7]/[0]", WiFi.localIP().toString());
+    sensorValueRange.set("values/[8]/[0]", formatDuration(lampu.totalRuntime));
+    sensorValueRange.set("values/[9]/[0]", formatDuration(kipas.totalRuntime));
 
     GSheet.values.append(&sensorResponse, spreadsheetId, String(sensorSheet + "!A1").c_str(), &sensorValueRange);
     sendLogs();
     lastSend = millis();
+    yield();
   }
-  
+
   static unsigned long lastLCD = 0;
-  if(millis() - lastLCD >= 2000) {
+  if (millis() - lastLCD >= 2000) {
     updateLCD();
     lastLCD = millis();
+    yield();
   }
 
   static unsigned long ventilationStart = 0;
   static bool isVentilating = false;
-  if(millis() - lastVentilation > VENTILATION_INTERVAL) {
+  if (millis() - lastVentilation > VENTILATION_INTERVAL) {
     digitalWrite(RELAY_KIPAS, HIGH);
     handleDeviceEvent("FAN", true);
     lastVentilation = millis();
     ventilationStart = millis();
     isVentilating = true;
+    yield();
   }
-  
-  if(isVentilating && (millis() - ventilationStart >= VENTILATION_DURATION)) {
+
+  if (isVentilating && (millis() - ventilationStart >= VENTILATION_DURATION)) {
     digitalWrite(RELAY_KIPAS, LOW);
     handleDeviceEvent("FAN", false);
     isVentilating = false;
+    yield();
   }
 }
