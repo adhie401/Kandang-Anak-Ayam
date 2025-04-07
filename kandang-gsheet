@@ -13,6 +13,7 @@
 DHT dht(DHTPIN, DHTTYPE);
 #define RELAY_KIPAS 14
 #define RELAY_LAMPU 12
+#define RELAY_HEATER 13
 #define MQ135_PIN A0
 #define MAX_LOGS 50
 #define SENSOR_INTERVAL 10000
@@ -26,7 +27,7 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600);
 ESP8266WebServer server(80);
 
 const char* ssid = "SSID";
-const char* password = "PaSSwoRd";
+const char* password = "Password";
 const unsigned long waktuMasukKandang = 1742428800;
 
 struct DeviceLog {
@@ -45,6 +46,7 @@ struct Device {
 
 Device lampu = {false, 0};
 Device kipas = {false, 0};
+Device heater = {false, 0};
 
 float suhu, kelembaban, amonia;
 unsigned long lampuStart = 0, kipasStart = 0, lastVentilation = 0;
@@ -99,11 +101,11 @@ void handleDeviceEvent(String type, bool state) {
   if (state) {
     logBuffer[logIndex] = {type, timeClient.getFormattedTime(), "", 0};
     if (type == "LAMP") lampuStart = millis();
-    else kipasStart = millis();
+    else if (type == "FAN") kipasStart = millis();
     addWebLog(type + " turned ON");
   } else {
     logBuffer[logIndex].end = timeClient.getFormattedTime();
-    logBuffer[logIndex].duration = (type == "LAMP") ? (millis() - lampuStart) : (millis() - kipasStart);
+    logBuffer[logIndex].duration = (type == "LAMP") ? (millis() - lampuStart) : (type == "FAN") ? (millis() - kipasStart) : 0;
     logIndex++;
     addWebLog(type + " turned OFF");
   }
@@ -161,46 +163,60 @@ bool bacaSensor() {
 void kontrolSuhu() {
   static bool currentLampState = false;
   static bool currentFanState = false;
-  
-  int umur = ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1;
+  static bool currentHeaterState = false;
+
+  int umur = ((timeClient.getEpochTime() - waktuMasukKandang) / 86400) + 1;
   auto suhuOptimal = getOptimalTemperature(umur);
   auto kelembabanOptimal = getOptimalHumidity(umur);
   int jam = timeClient.getHours();
-  
+  int menit = timeClient.getMinutes();
+
   bool newLampState = currentLampState;
   bool newFanState = currentFanState;
+  bool newHeaterState = currentHeaterState;
 
-  if(amonia >= 15) {
-    newLampState = LOW;
+  if (amonia >= 15) {
+    newHeaterState = LOW;
     newFanState = HIGH;
-  }
-  else if(kelembaban > kelembabanOptimal.second) {
-    newLampState = LOW;
+  } else if (kelembaban > kelembabanOptimal.second) {
+    newHeaterState = LOW;
     newFanState = HIGH;
-  }
-  else if(umur > 35) {
+  } else if (umur > 35) {
     bool waktuMalam = (jam >= 17 || jam < 7);
-    newLampState = waktuMalam ? (suhu < suhuOptimal.first ? HIGH : LOW) : LOW;
+    newHeaterState = waktuMalam ? (suhu < suhuOptimal.first ? HIGH : LOW) : LOW;
+    newFanState = (suhu >= (suhuOptimal.second + 0.5)) ? HIGH : LOW;
+  } else {
+    newHeaterState = (suhu < suhuOptimal.first) ? HIGH : (suhu >= suhuOptimal.second) ? LOW : currentHeaterState;
     newFanState = (suhu >= (suhuOptimal.second + 0.5)) ? HIGH : LOW;
   }
-  else {
-    newLampState = (suhu < suhuOptimal.first) ? HIGH : 
-                   (suhu >= suhuOptimal.second) ? LOW : currentLampState;
-    newFanState = (suhu >= (suhuOptimal.second + 0.5)) ? HIGH : LOW;
+
+  if (kelembaban < kelembabanOptimal.first) newFanState = LOW;
+
+  bool waktuLampuNyala = (jam >= 17 || (jam < 7 || (jam == 6 && menit <= 30)));
+  if (waktuLampuNyala || (currentHeaterState && (millis() - lampuStart > 5 * 60 * 1000))) {
+    newLampState = HIGH;
+  }
+  if (suhu >= suhuOptimal.second) {
+    newLampState = LOW;
   }
 
-  if(kelembaban < kelembabanOptimal.first) newFanState = LOW;
-
-  if(newLampState != currentLampState) {
-    digitalWrite(RELAY_LAMPU, newLampState);
-    handleDeviceEvent("LAMP", newLampState);
-    currentLampState = newLampState;
+  if (newHeaterState != currentHeaterState) {
+    digitalWrite(RELAY_HEATER, newHeaterState);
+    handleDeviceEvent("HEATER", newHeaterState);
+    currentHeaterState = newHeaterState;
+    if (newHeaterState == HIGH) lampuStart = millis();
   }
 
-  if(newFanState != currentFanState) {
+  if (newFanState != currentFanState) {
     digitalWrite(RELAY_KIPAS, newFanState);
     handleDeviceEvent("FAN", newFanState);
     currentFanState = newFanState;
+  }
+
+  if (newLampState != currentLampState) {
+    digitalWrite(RELAY_LAMPU, newLampState);
+    handleDeviceEvent("LAMP", newLampState);
+    currentLampState = newLampState;
   }
 }
 
@@ -276,7 +292,13 @@ void updateLCD() {
       lcd.setCursor(0, 1);
       lcd.print(digitalRead(RELAY_KIPAS)?"ON":"OFF");
       break;
-    case 9:
+      case 9:
+      lcd.setCursor(0, 0);
+      lcd.print("Heater:");
+      lcd.setCursor(0, 1);
+      lcd.print(digitalRead(RELAY_HEATER) ? "ON" : "OFF");
+      break;
+      case 10:
       lcd.setCursor(0, 0);
       lcd.print("Log Terakhir:");
       lcd.setCursor(0, 1);
@@ -288,7 +310,7 @@ void updateLCD() {
         lcd.print("No logs");
       }
       break;
-    case 10:
+    case 11:
       lcd.setCursor(0, 0);
       lcd.print("IP:");
       lcd.setCursor(0, 1);
@@ -328,17 +350,22 @@ void addWebLog(String message) {
 void setup() {
   Serial.begin(115200);
   WiFi.begin(ssid, password);
-  while(WiFi.status() != WL_CONNECTED) delay(500);
-  
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+
   timeClient.begin();
   timeClient.forceUpdate();
   dht.begin();
   lcd.init();
   lcd.backlight();
-  
+
   pinMode(RELAY_KIPAS, OUTPUT);
   pinMode(RELAY_LAMPU, OUTPUT);
-  
+  pinMode(RELAY_HEATER, OUTPUT);
+
+  digitalWrite(RELAY_LAMPU, LOW);
+  digitalWrite(RELAY_KIPAS, LOW);
+  digitalWrite(RELAY_HEATER, LOW);
+
   GSheet.begin(CLIENT_EMAIL, PROJECT_ID, PRIVATE_KEY);
 
   server.on("/", [=]() {
@@ -386,8 +413,9 @@ void setup() {
 
     html += "<div class='sensor-value'>";
     html += "<h3>Status Perangkat</h3>";
-    html += "<p>Lampu: " + String(lampu.state ? "ON" : "OFF") + " (Total: " + String(lampu.totalRuntime / 3600, 1) + " jam)</p>";
-    html += "<p>Kipas: " + String(kipas.state ? "ON" : "OFF") + " (Total: " + String(kipas.totalRuntime / 3600, 1) + " jam)</p>";
+    html += "<p>Lampu: " + String(digitalRead(RELAY_LAMPU) ? "ON" : "OFF") + "</p>";
+    html += "<p>Kipas: " + String(digitalRead(RELAY_KIPAS) ? "ON" : "OFF") + "</p>";
+    html += "<p>Heater: " + String(digitalRead(RELAY_HEATER) ? "ON" : "OFF") + "</p>";
     html += "</div>";
 
     html += "</div>";
@@ -435,9 +463,10 @@ void loop() {
     sensorValueRange.set("values/[4]/[0]", String(amonia, 2).toFloat());
     sensorValueRange.set("values/[5]/[0]", digitalRead(RELAY_LAMPU) ? "ON" : "OFF");
     sensorValueRange.set("values/[6]/[0]", digitalRead(RELAY_KIPAS) ? "ON" : "OFF");
-    sensorValueRange.set("values/[7]/[0]", WiFi.localIP().toString());
-    sensorValueRange.set("values/[8]/[0]", formatDuration(lampu.totalRuntime));
-    sensorValueRange.set("values/[9]/[0]", formatDuration(kipas.totalRuntime));
+    sensorValueRange.set("values/[7]/[0]", digitalRead(RELAY_HEATER) ? "ON" : "OFF");
+    sensorValueRange.set("values/[8]/[0]", WiFi.localIP().toString());
+    sensorValueRange.set("values/[9]/[0]", formatDuration(lampu.totalRuntime));
+    sensorValueRange.set("values/[10]/[0]", formatDuration(kipas.totalRuntime));
 
     GSheet.values.append(&sensorResponse, spreadsheetId, String(sensorSheet + "!A1").c_str(), &sensorValueRange);
     sendLogs();
