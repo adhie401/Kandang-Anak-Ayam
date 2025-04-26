@@ -15,7 +15,6 @@ DHT dht(DHTPIN, DHTTYPE);
 #define RELAY_LAMPU 12
 #define RELAY_HEATER 13
 #define MQ135_PIN A0
-#define MAX_LOGS 50
 #define SENSOR_INTERVAL 10000
 #define SEND_INTERVAL 300000
 #define VENTILATION_INTERVAL 3600000
@@ -26,58 +25,50 @@ WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600);
 ESP8266WebServer server(80);
 
-const char* ssid = "SSID";
-const char* password = "Password";
-const unsigned long waktuMasukKandang = 1742428800;
-
-struct DeviceLog {
-  String type;
-  String start;
-  String end;
-  unsigned long duration;
-};
-DeviceLog logBuffer[MAX_LOGS];
-int logIndex = 0;
-
-struct Device {
-  bool state;
-  unsigned long totalRuntime;
-};
-
-Device lampu = {false, 0};
-Device kipas = {false, 0};
-Device heater = {false, 0};
+const char* ssid = "WiFi-SSID";
+const char* password = "WiFi-Password";
+const unsigned long waktuMasukKandang = 1743897600;
 
 float suhu, kelembaban, amonia;
-unsigned long lampuStart = 0, kipasStart = 0, lastVentilation = 0;
+unsigned long heaterStart = 0, heaterStop = 0, fanStart = 0, fanStop = 0, lampStart = 0, lampStop = 0;
 int tampilanLCD = 0;
 
-const char* spreadsheetId = "1JmoSOS-vDcWTocTzMMD03yGqywlKXwkG2AljmN3zj4k";
-const String logSheet = "Logs";
+unsigned long lampDuration = 0;
+unsigned long fanDuration = 0;
+unsigned long heaterDuration = 0;
+
+const char* spreadsheetId = "Your-spreadsheet-ID";
 const String sensorSheet = "Sensor";
 
-#define PROJECT_ID "solid-heaven-365404"
-#define CLIENT_EMAIL "gsheet@solid-heaven-365404.iam.gserviceaccount.com"
-const char PRIVATE_KEY[] PROGMEM = "-----BEGIN PRIVATE KEY-----";
+#define PROJECT_ID "Your project ID"
+#define CLIENT_EMAIL "email service account"
+const char PRIVATE_KEY[] PROGMEM = "-----BEGIN PRIVATE KEY-----/ /-----END PRIVATE KEY-----\n";
+
+unsigned long lastVentilation = 0;
 
 String webLogs = "";
 
-std::pair<float, float> getOptimalTemperature(int umur) {
-  static const std::pair<float, float> tempTable[] = {{32.0,34.0},{30.0,32.0},{28.0,30.0},{26.0,28.0},{26.0,31.0}};
-  return tempTable[(umur <= 7) ? 0 : (umur <= 14) ? 1 : (umur <= 21) ? 2 : (umur <= 28) ? 3 : 4];
-}
+bool lastLampState = LOW;
+bool lastFanState = LOW;
+bool lastHeaterState = LOW;
 
-std::pair<float, float> getOptimalHumidity(int umur) {
-  if(umur <= 7) return {60.0, 70.0};
-  else if(umur <= 14) return {55.0, 65.0};
-  else return {50.0, 60.0};
+bool currentLampState = LOW;
+bool currentFanState = LOW;
+bool currentHeaterState = LOW;
+
+std::pair<float, float> getOptimalTemperature(int umur) {
+  static const std::pair<float, float> tempTable[] = {{32.0,34.0},{30.0,32.0},{28.0,30.0},{26.0,32.0},{26.0,30.0}};
+  return tempTable[(umur <= 7) ? 0 : (umur <= 14) ? 1 : (umur <= 21) ? 2 : (umur <= 28) ? 3 : 4];
 }
 
 String getFormattedDate(unsigned long epochTime) {
   time_t rawTime = epochTime;
   struct tm *timeInfo = localtime(&rawTime);
-  const char* bulan[] = {"Jan","Feb","Mar","Apr","Mei","Jun","Jul","Ags","Sep","Okt","Nov","Des"};
-  return String(timeInfo->tm_mday) + " " + bulan[timeInfo->tm_mon] + " " + String(timeInfo->tm_year + 1900);
+  const char* bulan[] = {"Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Ags", "Sep", "Okt", "Nov", "Des"};
+  
+  char buffer[30];
+  snprintf(buffer, sizeof(buffer), "%02d %s %04d", timeInfo->tm_mday, bulan[timeInfo->tm_mon], timeInfo->tm_year + 1900);
+  return String(buffer);
 }
 
 float getAmoniaPPM() {
@@ -91,66 +82,9 @@ String formatDuration(unsigned long ms) {
   return String(buf);
 }
 
-void handleDeviceEvent(String type, bool state) {
-  noInterrupts();
-  if (logIndex >= MAX_LOGS) {
-    memmove(&logBuffer[0], &logBuffer[1], sizeof(DeviceLog) * (MAX_LOGS - 1));
-    logIndex = MAX_LOGS - 1;
-  }
-
-  if (state) {
-    logBuffer[logIndex] = {type, timeClient.getFormattedTime(), "", 0};
-    if (type == "LAMP") lampuStart = millis();
-    else if (type == "FAN") kipasStart = millis();
-    addWebLog(type + " turned ON");
-  } else {
-    logBuffer[logIndex].end = timeClient.getFormattedTime();
-    logBuffer[logIndex].duration = (type == "LAMP") ? (millis() - lampuStart) : (type == "FAN") ? (millis() - kipasStart) : 0;
-    logIndex++;
-    addWebLog(type + " turned OFF");
-  }
-  addWebLog("Current logIndex: " + String(logIndex));
-  interrupts();
-}
-
-void sendLogs() {
-  if (WiFi.status() == WL_CONNECTED && GSheet.ready() && logIndex > 0) {
-    noInterrupts();
-    FirebaseJson response;
-    FirebaseJson valueRange;
-    valueRange.add("majorDimension", "ROWS");
-
-    int logsToSend = min(logIndex, 10);
-    for (int i = 0; i < logsToSend; i++) {
-      valueRange.set("values/[" + String(i) + "]/[0]", logBuffer[i].type);
-      valueRange.set("values/[" + String(i) + "]/[1]", logBuffer[i].start);
-      valueRange.set("values/[" + String(i) + "]/[2]", logBuffer[i].end);
-      valueRange.set("values/[" + String(i) + "]/[3]", formatDuration(logBuffer[i].duration));
-      yield();
-    }
-
-    bool success = GSheet.values.append(&response, spreadsheetId, String(logSheet + "!A1").c_str(), &valueRange);
-
-    if (success) {
-      addWebLog("Logs sent successfully.");
-      memmove(&logBuffer[0], &logBuffer[logsToSend], sizeof(DeviceLog) * (logIndex - logsToSend));
-      logIndex -= logsToSend;
-      addWebLog("Updated logIndex: " + String(logIndex));
-    } else {
-      addWebLog("Failed to send logs.");
-      addWebLog("Response: " + String(response.raw()));
-    }
-    interrupts();
-  } else {
-    if (WiFi.status() != WL_CONNECTED) addWebLog("WiFi is not connected.");
-    if (!GSheet.ready()) addWebLog("Google Sheets API is not ready.");
-    if (logIndex <= 0) addWebLog("No logs available to send.");
-  }
-}
-
 bool bacaSensor() {
   static unsigned long lastRead = 0;
-  if(millis()-lastRead >= SENSOR_INTERVAL) {
+  if (millis() - lastRead >= SENSOR_INTERVAL) {
     suhu = dht.readTemperature();
     kelembaban = dht.readHumidity();
     amonia = getAmoniaPPM();
@@ -160,70 +94,213 @@ bool bacaSensor() {
   return false;
 }
 
-void kontrolSuhu() {
-  static bool currentLampState = false;
-  static bool currentFanState = false;
-  static bool currentHeaterState = false;
+void handleDeviceEvent(String device, bool state) {
+    String status = state ? "ON" : "OFF";
+    addWebLog(device + " status changed to " + status);
+}
 
+void kontrolSuhu() {
   int umur = ((timeClient.getEpochTime() - waktuMasukKandang) / 86400) + 1;
   auto suhuOptimal = getOptimalTemperature(umur);
-  auto kelembabanOptimal = getOptimalHumidity(umur);
   int jam = timeClient.getHours();
-  int menit = timeClient.getMinutes();
 
   bool newLampState = currentLampState;
   bool newFanState = currentFanState;
   bool newHeaterState = currentHeaterState;
 
-  if (amonia >= 15) {
-    newHeaterState = LOW;
-    newFanState = HIGH;
-  } else if (kelembaban > kelembabanOptimal.second) {
-    newHeaterState = LOW;
-    newFanState = HIGH;
-  } else if (umur > 35) {
+  if (umur > 35) {
     bool waktuMalam = (jam >= 17 || jam < 7);
-    newHeaterState = waktuMalam ? (suhu < suhuOptimal.first ? HIGH : LOW) : LOW;
-    newFanState = (suhu >= (suhuOptimal.second + 0.5)) ? HIGH : LOW;
-  } else {
-    newHeaterState = (suhu < suhuOptimal.first) ? HIGH : (suhu >= suhuOptimal.second) ? LOW : currentHeaterState;
-    newFanState = (suhu >= (suhuOptimal.second + 0.5)) ? HIGH : LOW;
-  }
-
-  if (kelembaban < kelembabanOptimal.first) newFanState = LOW;
-
-  bool waktuLampuNyala = (jam >= 17 || (jam < 7 || (jam == 6 && menit <= 30)));
-  if (waktuLampuNyala || (currentHeaterState && (millis() - lampuStart > 5 * 60 * 1000))) {
+    if (waktuMalam) {
+        newLampState = HIGH;
+        if (newLampState != currentLampState) {
+          digitalWrite(RELAY_LAMPU, newLampState);
+          handleDeviceEvent("LAMP", newLampState);
+          currentLampState = newLampState;
+          addWebLog("Lampu dinyalakan waktu malam");
+        }
+    if (suhu < suhuOptimal.first) {
+      if (newHeaterState != HIGH) {
+          newHeaterState = HIGH;
+          addWebLog("Heater dinyalakan karena suhu rendah.");
+          if (amonia > 15 || kelembaban > 80) {
+            if (newFanState != HIGH) {
+                newFanState = HIGH;
+                addWebLog("5. Kipas dinyalakan karena amonia > 15 atau kelembaban > 80.");
+            }
+        } else if (amonia < 15 && kelembaban < 70) {
+            if (newFanState != LOW) {
+                newFanState = LOW;
+                addWebLog("5. Kipas dimatikan karena amonia < 15 dan kelembaban < 70.");
+              }
+            }
+        }
+      } else if (suhu > suhuOptimal.second) {
+          if (newHeaterState != LOW) {
+              newHeaterState = LOW;
+              newFanState = HIGH;
+              addWebLog("Heater dimatikan & Kipas dinyalakan karena suhu tinggi.");
+          } else if(newHeaterState == LOW){
+              if (newFanState != HIGH){
+                newFanState = HIGH;
+                addWebLog("Suhu tinggi heater dalam keadaan mati, kipas dinyalakan.");
+              }
+            }
+            else if (amonia > 15 || kelembaban > 80) {
+                if (newFanState != HIGH) {
+                    newFanState = HIGH;
+                    addWebLog("6. Kipas dinyalakan karena amonia > 15 atau kelembaban > 80.");
+                }
+            } else if (amonia < 15 && kelembaban < 70) {
+                if (newFanState != LOW) {
+                    newFanState = LOW;
+                    addWebLog("6. Kipas dimatikan karena amonia < 15, dan kelembaban < 70.");
+                }          
+            }
+      } else {
+          if (newHeaterState != LOW) {
+              newHeaterState = LOW;
+              addWebLog("Heater dimatikan karena suhu dalam rentang optimal.");
+          } else if (amonia > 15 || kelembaban > 80) {
+                if (newFanState != HIGH) {
+                    newFanState = HIGH;
+                    addWebLog("7. Kipas dinyalakan karena amonia > 15 atau kelembaban > 80.");
+                }
+            } else if (amonia < 15 && kelembaban < 70) {
+                if (newFanState != LOW) {
+                    newFanState = LOW;
+                    addWebLog("7. Kipas dimatikan karena amonia < 15, dan kelembaban < 70.");
+                }          
+            }
+      }
+    if (newLampState != currentLampState) {
+          currentLampState = newLampState;
+          addWebLog("Lampu " + String(newLampState ? "dinyalakan" : "dimatikan") + ".");
+      }
+    if (newLampState != HIGH && currentHeaterState && (millis() - heaterStart > 5 * 60 * 1000)) {
+        addWebLog("Heater telah menyala lebih dari 5 menit.");
+        newLampState = HIGH;
+        addWebLog("Lampu dinyalakan untuk membantu pemanasan.");
+      }
+    }
+} else {
     newLampState = HIGH;
-  }
-  if (suhu >= suhuOptimal.second) {
-    newLampState = LOW;
-  }
+    if (newLampState != currentLampState) {
+      digitalWrite(RELAY_LAMPU, newLampState);
+      handleDeviceEvent("LAMP", newLampState);
+      currentLampState = newLampState;
+      addWebLog("Lampu dinyalakan (Umur <= 35).");
+    }
+    if (suhu < suhuOptimal.first) {
+      if (newHeaterState != HIGH) {
+          newHeaterState = HIGH;
+          addWebLog("Heater dinyalakan karena suhu rendah.");
+          if (amonia > 15 || kelembaban > 80) {
+            if (newFanState != HIGH) {
+                newFanState = HIGH;
+                addWebLog("5. Kipas dinyalakan karena amonia > 15 atau kelembaban > 80.");
+            }
+        } else if (amonia < 15 && kelembaban < 70) {
+            if (newFanState != LOW) {
+                newFanState = LOW;
+                addWebLog("5. Kipas dimatikan karena amonia < 15 dan kelembaban < 70.");
+              }
+            }
+        }
+      } else if (suhu > suhuOptimal.second) {
+          if (newHeaterState != LOW) {
+              newHeaterState = LOW;
+              newFanState = HIGH;
+              addWebLog("Heater dimatikan & Kipas dinyalakan karena suhu tinggi.");
+          } else if(newHeaterState == LOW){
+              if (newFanState != HIGH){
+                newFanState = HIGH;
+                addWebLog("Suhu tinggi heater dalam keadaan mati, kipas dinyalakan.");
+              }
+            }
+            else if (amonia > 15 || kelembaban > 80) {
+                if (newFanState != HIGH) {
+                    newFanState = HIGH;
+                    addWebLog("6. Kipas dinyalakan karena amonia > 15 atau kelembaban > 80.");
+                }
+            } else if (amonia < 15 && kelembaban < 70) {
+                if (newFanState != LOW) {
+                    newFanState = LOW;
+                    addWebLog("6. Kipas dimatikan karena amonia < 15, dan kelembaban < 70.");
+                }          
+            }
+      } else {
+          if (newHeaterState != LOW) {
+              newHeaterState = LOW;
+              addWebLog("Heater dimatikan karena suhu dalam rentang optimal.");
+          } else if (amonia > 15 || kelembaban > 80) {
+                if (newFanState != HIGH) {
+                    newFanState = HIGH;
+                    addWebLog("7. Kipas dinyalakan karena amonia > 15 atau kelembaban > 80.");
+                }
+            } else if (amonia < 15 && kelembaban < 70) {
+                if (newFanState != LOW) {
+                    newFanState = LOW;
+                    addWebLog("7. Kipas dimatikan karena amonia < 15, dan kelembaban < 70.");
+                }          
+            }
+      }
+    if (newLampState != currentLampState) {
+          currentLampState = newLampState;
+          addWebLog("Lampu " + String(newLampState ? "dinyalakan" : "dimatikan") + ".");
+      }
+    if (newLampState != HIGH && currentHeaterState && (millis() - heaterStart > 5 * 60 * 1000)) {
+        addWebLog("Heater telah menyala lebih dari 5 menit.");
+        newLampState = HIGH;
+        addWebLog("Lampu dinyalakan untuk membantu pemanasan.");
+    }
+}
 
-  if (newHeaterState != currentHeaterState) {
+if (newHeaterState != currentHeaterState) {
     digitalWrite(RELAY_HEATER, newHeaterState);
     handleDeviceEvent("HEATER", newHeaterState);
     currentHeaterState = newHeaterState;
-    if (newHeaterState == HIGH) lampuStart = millis();
-  }
+    if (newHeaterState == HIGH) {
+        heaterStart = millis();
+        addWebLog("Heater dinyalakan.");
+    } else {
+        heaterStop = millis();
+        heaterDuration = heaterStop - heaterStart;
+        addWebLog("Heater dimatikan. Durasi: " + formatDuration(heaterDuration));
+    }
+}
 
-  if (newFanState != currentFanState) {
+if (newFanState != currentFanState) {
     digitalWrite(RELAY_KIPAS, newFanState);
     handleDeviceEvent("FAN", newFanState);
     currentFanState = newFanState;
-  }
+    if (newFanState == HIGH) {
+        fanStart = millis();
+        addWebLog("Kipas dinyalakan.");
+    } else {
+        fanStop = millis();
+        fanDuration = fanStop - fanStart;
+        addWebLog("Kipas dimatikan. Durasi: " + formatDuration(fanDuration));
+    }
+}
 
-  if (newLampState != currentLampState) {
+if (newLampState != currentLampState) {
     digitalWrite(RELAY_LAMPU, newLampState);
     handleDeviceEvent("LAMP", newLampState);
     currentLampState = newLampState;
-  }
+        if (newLampState == HIGH) {
+            lampStart = millis();
+            addWebLog("Lampu dinyalakan.");
+        } else {
+            lampStop = millis();
+            lampDuration = lampStop - lampStart;
+            addWebLog("Lampu dimatikan. Durasi: " + formatDuration(lampDuration));
+        }
+    }
 }
-
 void updateLCD() {
   static int lastPage = -1;
   static unsigned long lastUpdate = 0;
-  
+                                                               
   if(millis() - lastUpdate < 2000) return;
   lastUpdate = millis();
 
@@ -235,7 +312,6 @@ void updateLCD() {
 
   int umur = ((timeClient.getEpochTime()-waktuMasukKandang)/86400)+1;
   auto suhuOptimal = getOptimalTemperature(umur);
-  auto kelembabanOptimal = getOptimalHumidity(umur);
   
   switch(currentPage) {
     case 0:
@@ -272,7 +348,7 @@ void updateLCD() {
       lcd.setCursor(0, 0);
       lcd.print("Kelemb: " + String(kelembaban,0) + "%");
       lcd.setCursor(0, 1);
-      lcd.print("Range : " + String(kelembabanOptimal.first,0) + "-" + String(kelembabanOptimal.second,0) + "%");
+      lcd.print("tgt : 80 %");
       break;
     case 6:
       lcd.setCursor(0, 0);
@@ -298,19 +374,7 @@ void updateLCD() {
       lcd.setCursor(0, 1);
       lcd.print(digitalRead(RELAY_HEATER) ? "ON" : "OFF");
       break;
-      case 10:
-      lcd.setCursor(0, 0);
-      lcd.print("Log Terakhir:");
-      lcd.setCursor(0, 1);
-      if (logIndex > 0) {
-        int showIndex = logIndex - 1;
-        lcd.print(logBuffer[showIndex].start.substring(0, 5) + "-" +
-                  (logBuffer[showIndex].end != "" ? logBuffer[showIndex].end.substring(0, 5) : "ON"));
-      } else {
-        lcd.print("No logs");
-      }
-      break;
-    case 11:
+    case 10:
       lcd.setCursor(0, 0);
       lcd.print("IP:");
       lcd.setCursor(0, 1);
@@ -343,8 +407,12 @@ void updateTime() {
 }
 
 void addWebLog(String message) {
-  String timestamp = getFormattedDate(timeClient.getEpochTime()) + " " + timeClient.getFormattedTime();
-  webLogs += "<p><span class='timestamp'>[" + timestamp + "]</span> " + message + "</p>";
+    String timestamp = getFormattedDate(timeClient.getEpochTime()) + " " + timeClient.getFormattedTime();
+    String logEntry = "<p><span class='timestamp'>[" + timestamp + "]</span> " + message + "</p>";
+    if (webLogs.length() + logEntry.length() > 2048) { 
+        webLogs = webLogs.substring(logEntry.length());
+    }
+    webLogs += logEntry;
 }
 
 void setup() {
@@ -400,8 +468,8 @@ void setup() {
     html += "<h3>Status Sistem</h3>";
     html += "<p>Waktu: " + getFormattedDate(timeClient.getEpochTime()) + " " + timeClient.getFormattedTime() + "</p>";
     html += "<p>Umur Ayam: " + String(umur) + " hari</p>";
+    html += "<p>Tanggal Masuk Kandang: " + getFormattedDate(waktuMasukKandang)+"</p>";
     html += "<p>Range Suhu Optimal: <span class='range-value'>" + String(getOptimalTemperature(umur).first, 1) + "°C - " + String(getOptimalTemperature(umur).second, 1) + "°C</span></p>";
-    html += "<p>Range Kelembaban Optimal: <span class='range-value'>" + String(getOptimalHumidity(umur).first, 1) + "% - " + String(getOptimalHumidity(umur).second, 1) + "%</span></p>";
     html += "</div>";
 
     html += "<div class='sensor-value'>";
@@ -442,14 +510,15 @@ void loop() {
   updateTime();
   server.handleClient();
   yield();
-  
-  if (bacaSensor()) kontrolSuhu();
-  
+
+  if (bacaSensor()) {
+    kontrolSuhu();
+  }
   static unsigned long lastSend = 0;
   if (millis() - lastSend >= SEND_INTERVAL) {
     if (!GSheet.ready()) {
-      addWebLog("Google Sheets API is not ready. Check credentials or API configuration.");
-      return;
+        addWebLog("Google Sheets API is not ready. Check credentials or API configuration.");
+        return;
     }
 
     FirebaseJson sensorResponse;
@@ -465,11 +534,15 @@ void loop() {
     sensorValueRange.set("values/[6]/[0]", digitalRead(RELAY_KIPAS) ? "ON" : "OFF");
     sensorValueRange.set("values/[7]/[0]", digitalRead(RELAY_HEATER) ? "ON" : "OFF");
     sensorValueRange.set("values/[8]/[0]", WiFi.localIP().toString());
-    sensorValueRange.set("values/[9]/[0]", formatDuration(lampu.totalRuntime));
-    sensorValueRange.set("values/[10]/[0]", formatDuration(kipas.totalRuntime));
 
-    GSheet.values.append(&sensorResponse, spreadsheetId, String(sensorSheet + "!A1").c_str(), &sensorValueRange);
-    sendLogs();
+    if (GSheet.values.append(&sensorResponse, spreadsheetId, String(sensorSheet + "!A1").c_str(), &sensorValueRange)) {
+        addWebLog("Data berhasil dikirim ke Google Sheets.");
+    } else {
+        addWebLog("Gagal mengirim data ke Google Sheets. Periksa koneksi atau konfigurasi API.");
+    }
+    sensorResponse.clear();
+    sensorValueRange.clear();
+
     lastSend = millis();
     yield();
   }
@@ -485,17 +558,53 @@ void loop() {
   static bool isVentilating = false;
   if (millis() - lastVentilation > VENTILATION_INTERVAL) {
     digitalWrite(RELAY_KIPAS, HIGH);
-    handleDeviceEvent("FAN", true);
     lastVentilation = millis();
     ventilationStart = millis();
     isVentilating = true;
+    addWebLog("Kipas dinyalakan untuk ventilasi.");
     yield();
   }
 
   if (isVentilating && (millis() - ventilationStart >= VENTILATION_DURATION)) {
     digitalWrite(RELAY_KIPAS, LOW);
-    handleDeviceEvent("FAN", false);
     isVentilating = false;
-    yield();
+    addWebLog("Kipas dimatikan, ventilasi selesai.");
+  }
+
+  static unsigned long lastLogSend = 0;
+  if (millis() - lastLogSend >= SEND_INTERVAL) {
+    if (!GSheet.ready()) {
+        addWebLog("Google Sheets API is not ready. Check credentials or API configuration.");
+        return;
+    }
+    if (lastLampState != currentLampState || lastFanState != currentFanState || lastHeaterState != currentHeaterState) {
+        FirebaseJson logResponse;
+        FirebaseJson logValueRange;
+
+        logValueRange.add("majorDimension", "ROWS");
+        logValueRange.set("values/[0]/[0]", getFormattedDate(timeClient.getEpochTime()) + " " + timeClient.getFormattedTime());
+        logValueRange.set("values/[0]/[1]", "Lampu");
+        logValueRange.set("values/[0]/[2]", currentLampState ? "ON" : "OFF");
+        logValueRange.set("values/[0]/[3]", formatDuration(lampDuration));
+        logValueRange.set("values/[1]/[0]", getFormattedDate(timeClient.getEpochTime()) + " " + timeClient.getFormattedTime());
+        logValueRange.set("values/[1]/[1]", "Kipas");
+        logValueRange.set("values/[1]/[2]", currentFanState ? "ON" : "OFF");
+        logValueRange.set("values/[1]/[3]", formatDuration(fanDuration));
+        logValueRange.set("values/[2]/[0]", getFormattedDate(timeClient.getEpochTime()) + " " + timeClient.getFormattedTime());
+        logValueRange.set("values/[2]/[1]", "Heater");
+        logValueRange.set("values/[2]/[2]", currentHeaterState ? "ON" : "OFF");
+        logValueRange.set("values/[2]/[3]", formatDuration(heaterDuration));
+
+        if (GSheet.values.append(&logResponse, spreadsheetId, String("Logs!A1").c_str(), &logValueRange)) {
+            addWebLog("Log perubahan status berhasil dikirim ke Google Sheets.");
+        } else {
+            addWebLog("Gagal mengirim log perubahan status ke Google Sheets. Periksa koneksi atau konfigurasi API.");
+        }
+        lastLampState = currentLampState;
+        lastFanState = currentFanState;
+        lastHeaterState = currentHeaterState;
+        lastLogSend = millis();
+        yield();
+    }
   }
 }
